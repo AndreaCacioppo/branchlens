@@ -1,0 +1,47 @@
+name: Bug report
+description: BranchLens did something wrong or refused to start.
+labels: [bug]
+body:
+  - type: textarea
+    id: ran
+    attributes:
+      label: What you ran
+      description: The command, and what you clicked on the page.
+    validations:
+      required: true
+  - type: textarea
+    id: saw
+    attributes:
+      label: What you saw
+      description: The terminal output or the message on the page, and what you expected instead.
+    validations:
+      required: true
+  - type: input
+    id: branchlens-version
+    attributes:
+      label: branchlens --version
+      placeholder: branchlens 0.3.0
+    validations:
+      required: true
+  - type: input
+    id: git-version
+    attributes:
+      label: git --version
+      placeholder: git version 2.45.0
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: python3 --version
+      placeholder: Python 3.12.4
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true

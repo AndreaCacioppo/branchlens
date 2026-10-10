@@ -1,0 +1,39 @@
+# ============================================================================
+# Justified exceptions, WITH AN EXPIRY DATE, to the security checks.
+#
+# An exception is for when a check reports a NEW problem that you cannot fix
+# straight away for a documentable reason (for example a CVE with no released
+# fix). It is NOT for pre-existing problems: those are already covered by the
+# baseline.
+#
+# FORMAT - one exception per line, 5 fields separated by | :
+#
+#   identifier | scanner | reason | owner | expiry
+#
+#   identifier  ONE component of the fingerprint printed in the report: the CVE
+#               (e.g. CVE-2025-1234), the semgrep rule id, the SpotBugs bug type
+#               (e.g. SQL_INJECTION_JDBC), or a file path.
+#               WARNING: NOT the full fingerprint with its vertical bars ('|' is
+#               the field separator of THIS file: a line with an extra '|' comes
+#               out malformed and blocks the gate). And the component suppresses
+#               EVERY fingerprint of its scanner in which it appears: choose the
+#               most specific one you can.
+#   scanner     trivy | semgrep | spotbugs | checkstyle
+#   reason      why waiting is acceptable (be specific)
+#   owner       who answers for this exception (your name or username)
+#   expiry      YYYY-MM-DD - after this date the "Exceptions" check FAILS and
+#               the gate (make check) stays blocked until the exception is
+#               removed (by fixing the problem) or renewed by hand
+#
+# RULES:
+#   - you edit this file yourself: it is your exception, with your reason and
+#     your expiry date. The ritual is for your benefit.
+#   - short expiry dates: 30-90 days; an exception that lives longer than six
+#     months is a planning problem, not an exception
+#   - a malformed line (bad date, missing fields) makes the check FAIL: a typo
+#     must never turn into an eternal exception
+#
+# EXAMPLE (commented out):
+# CVE-2026-00000 | trivy | Fix not yet released upstream, issue #123 open, endpoint not reachable from the internet | your.username | 2026-10-01
+# ============================================================================
+B314 checks/gate.py | bandit | ElementTree.parse runs only behind the DOCTYPE/ENTITY refusal guard in parse_test_report_xml, on JUnit reports this gate generates itself by running the target's test suite | maintainer | 2027-08-24

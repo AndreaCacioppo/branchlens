@@ -1,0 +1,104 @@
+# LOCAL anti-XSS Semgrep rules for the frontend (JavaScript/TypeScript).
+#
+# Why they exist: the p/security-audit ruleset, on its own, does NOT catch XSS
+# through innerHTML fed by application data (verified: a real stored XSS in a
+# dashboard went through untouched). These rules cover the most common DOM
+# "sinks": if a non-literal value ends up in one of them, they report it.
+#
+# What they do and what they do NOT do:
+#  - they report the SINK (the dangerous use), not "missing escaping": they do
+#    not know whether you applied an escaping function. Their job is to make a
+#    human LOOK at that spot.
+#  - the gate runs them on the changed files at HEAD and at the base commit,
+#    and reports only what is new at HEAD: a sink that already existed does
+#    not bother you, only a NEW sink introduced by your change blocks.
+#  - the right answer to a finding: use textContent for text, or apply HTML
+#    escaping / a sanitizer before interpolating.
+
+rules:
+  - id: xss-innerhtml-outerhtml-non-literal
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >
+      Assignment to .innerHTML/.outerHTML of a non-literal value: if it contains
+      data a user can modify, this is an XSS. Use textContent, or apply HTML
+      escaping before interpolating.
+    patterns:
+      - pattern-either:
+          - pattern: $EL.innerHTML = $VAL
+          - pattern: $EL.outerHTML = $VAL
+      - metavariable-pattern:
+          metavariable: $VAL
+          patterns:
+            - pattern-not: "'...'"
+            - pattern-not: "\"...\""
+
+  - id: xss-insertadjacenthtml-non-literal
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >
+      insertAdjacentHTML with non-literal content: possible XSS if the value
+      contains user data. Use insertAdjacentText, or apply escaping/a sanitizer.
+    patterns:
+      - pattern: $EL.insertAdjacentHTML($POS, $VAL)
+      - metavariable-pattern:
+          metavariable: $VAL
+          patterns:
+            - pattern-not: "'...'"
+            - pattern-not: "\"...\""
+
+  - id: xss-document-write-non-literal
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >
+      document.write/writeln with non-literal content: possible XSS.
+    patterns:
+      - pattern-either:
+          - pattern: document.write($VAL)
+          - pattern: document.writeln($VAL)
+      - metavariable-pattern:
+          metavariable: $VAL
+          patterns:
+            - pattern-not: "'...'"
+            - pattern-not: "\"...\""
+
+  # jQuery sink: .html() interprets the string as HTML, exactly like innerHTML.
+  # Very common in legacy code. (We do NOT cover .append()/.prepend(): those
+  # also exist on the native DOM Element, where they insert TEXT and are safe -
+  # reporting them would produce false positives on healthy code.)
+  - id: xss-jquery-html-non-literal
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >
+      .html() with non-literal content: if the object is a jQuery object and the
+      value contains data a user can modify, this is an XSS. Use .text() for
+      text, or apply HTML escaping before interpolating.
+    patterns:
+      - pattern: $EL.html($VAL)
+      - metavariable-pattern:
+          metavariable: $VAL
+          patterns:
+            - pattern-not: "'...'"
+            - pattern-not: "\"...\""
+
+  # setAttribute("onclick", ...) and friends: assigning an event handler from a
+  # string is equivalent to executing code from a string. Here we report literal
+  # values too: it is a practice to replace with addEventListener in any case.
+  - id: xss-setattribute-event-handler
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >
+      setAttribute of an on* attribute (an event handler): the value is executed
+      as code. If it contains user data it is an XSS; in any case use
+      addEventListener instead of a string.
+    patterns:
+      - pattern: $EL.setAttribute("$ATTR", $VAL)
+      - metavariable-regex:
+          metavariable: $ATTR
+          regex: "(?i)^on."
+
+# Sinks NOT covered by these rules (an honest limit, see VERIFICATION.md):
+#   - location.href / window.open with "javascript:" URLs built from data
+#   - eval / new Function / setTimeout with a string argument
+#   - src/href attributes set through the property (el.src = ...)
+# For these the safety nets remain the security tests and human review.

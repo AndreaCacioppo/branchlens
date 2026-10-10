@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.9", "3.x"]
+        exclude:
+          # setup-python's newest Python 3.9 for the arm64 macOS runners is
+          # 3.9.13, so 3.9 is tested on Ubuntu only.
+          - os: macos-latest
+            python-version: "3.9"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: git --version
+      - run: python -m py_compile branchlens src/branchlens/*.py
+      - run: bash test.sh
+      # Install the package and start it from both entry points.
+      - run: python -m pip install .
+      - run: branchlens --version
+      - run: cd "$RUNNER_TEMP" && python -m branchlens --version
+
+  toolkit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - run: python -m pip install semgrep bandit pytest
+      - run: git --version && semgrep --version && node --version
+      # The deep dives run only for skills installed in ~/.claude/skills.
+      - run: make -C toolkit install-skills
+      - run: python -m pytest toolkit/tests -q

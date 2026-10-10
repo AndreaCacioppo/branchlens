@@ -1,0 +1,105 @@
+# LOCAL rules for Kotlin (.kt, .kts), written for Android apps.
+#
+# Every finding of a local rule blocks the gate. A Kotlin file semgrep could
+# only partly parse, or that is not UTF-8 (a string template in it can go
+# unmatched), is named in the "Code without scanner rules" row, a caveat.
+#
+# "Built from a string" below means a concatenation (a + b) or a string
+# template ("... $x ..." or "... ${x} ..."): the text of the argument is
+# matched, so a plain variable or a literal is not flagged.
+
+rules:
+  - id: kotlin-command-from-string
+    languages: [kotlin]
+    severity: ERROR
+    message: >
+      A command line built from a string and run by Runtime.exec: if any
+      part can come from a user, a file or the network, it is command
+      injection (exec also splits the string on spaces). Pass a fixed
+      command and its arguments as an array.
+    pattern-either:
+      - patterns:
+          - pattern: Runtime.getRuntime().exec($A + $B, ...)
+          - pattern-not: Runtime.getRuntime().exec("..." + "...", ...)
+      - patterns:
+          - pattern: Runtime.getRuntime().exec($COMMAND, ...)
+          - metavariable-regex:
+              metavariable: $COMMAND
+              regex: ^".*\$[{A-Za-z_]
+
+  # Not flagged: SQL built only from string literals and UPPER_SNAKE_CASE
+  # constants (TABLE_NAME, FeedEntry.TABLE_NAME, BaseColumns._ID, as a +
+  # operand or as $TABLE / ${FeedEntry.TABLE_NAME} in a template).
+  - id: kotlin-sql-from-string
+    languages: [kotlin]
+    severity: ERROR
+    message: >
+      SQL built from a string and run by rawQuery or execSQL: SQL injection
+      if any part can be influenced from outside. Use ? placeholders and
+      pass the values as selectionArgs / bindArgs.
+    patterns:
+      - pattern-either:
+          - pattern: $DB.rawQuery($SQL, ...)
+          - pattern: $DB.execSQL($SQL, ...)
+      - pattern-either:
+          # a concatenation
+          - pattern: $DB.rawQuery($A + $B, ...)
+          - pattern: $DB.execSQL($A + $B, ...)
+          # a string template
+          - patterns:
+              - pattern-either:
+                  - pattern: $DB.rawQuery($SQL, ...)
+                  - pattern: $DB.execSQL($SQL, ...)
+              - metavariable-regex:
+                  metavariable: $SQL
+                  regex: ^".*\$[{A-Za-z_]
+      # the whole argument is not: literals and constants joined by +
+      - metavariable-regex:
+          metavariable: $SQL
+          regex: ^(?!\s*(?:"(?:[^"\\$]|\\.|\$(?:_*[A-Z][A-Z0-9_]*(?![A-Za-z0-9_])|\{\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)*_*[A-Z][A-Z0-9_]*\s*\}))*"|(?:[A-Za-z_][A-Za-z0-9_]*\.)*_*[A-Z][A-Z0-9_]*)(?:\s*\+\s*(?:"(?:[^"\\$]|\\.|\$(?:_*[A-Z][A-Z0-9_]*(?![A-Za-z0-9_])|\{\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)*_*[A-Z][A-Z0-9_]*\s*\}))*"|(?:[A-Za-z_][A-Za-z0-9_]*\.)*_*[A-Z][A-Z0-9_]*))*\s*$)
+
+  # Both calls in the same block, the setting first.
+  - id: kotlin-webview-javascript-interface
+    languages: [kotlin]
+    severity: ERROR
+    message: >
+      A WebView with JavaScript enabled exposes a Kotlin object through
+      addJavascriptInterface: every page it loads, including one reached by
+      a redirect or injected over plain HTTP, can call that object's
+      @JavascriptInterface methods. Load only your own content over HTTPS,
+      or drop the interface.
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              $SETTINGS.javaScriptEnabled = true
+              ...
+          - pattern-inside: |
+              $SETTINGS.setJavaScriptEnabled(true)
+              ...
+      - pattern: $WEBVIEW.addJavascriptInterface(...)
+
+  - id: kotlin-weak-hash
+    languages: [kotlin]
+    severity: WARNING
+    message: >
+      MD5 and SHA-1 are broken for security use: collisions can be made on
+      purpose. Use SHA-256 or better for integrity, and a password hash
+      (PBKDF2, bcrypt, Argon2) for passwords.
+    pattern-either:
+      - pattern: MessageDigest.getInstance("=~/(?i)^(md5|sha-?1)$/")
+      - pattern: java.security.MessageDigest.getInstance("=~/(?i)^(md5|sha-?1)$/")
+
+  # localhost, 127.0.0.1 and 10.0.2.2 (the Android emulator's view of the
+  # host machine) are development addresses and are not flagged.
+  - id: kotlin-cleartext-http-url
+    languages: [kotlin]
+    severity: WARNING
+    message: >
+      A network call to an http:// URL: anyone on the same network (public
+      Wi-Fi, a proxy) can read and change what is sent and received. Use
+      https://.
+    pattern-either:
+      - pattern: URL("=~/^http:\/\/(?!localhost|127\.0\.0\.1|10\.0\.2\.2)/")
+      - pattern: java.net.URL("=~/^http:\/\/(?!localhost|127\.0\.0\.1|10\.0\.2\.2)/")
+      - pattern: $BUILDER.url("=~/^http:\/\/(?!localhost|127\.0\.0\.1|10\.0\.2\.2)/")
+      - pattern: $BUILDER.baseUrl("=~/^http:\/\/(?!localhost|127\.0\.0\.1|10\.0\.2\.2)/")

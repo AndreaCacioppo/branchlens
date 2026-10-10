@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Thin launcher for BranchLens.
+
+Resolves its own real location (following symlinks, so a symlink placed in
+a PATH directory works), makes Python able to import the branchlens package
+from the src folder next to it, then starts the server.
+"""
+
+import sys
+from pathlib import Path
+
+launcher_directory = Path(__file__).resolve().parent
+sys.path.insert(0, str(launcher_directory / "src"))
+
+from branchlens import server
+
+server.main()

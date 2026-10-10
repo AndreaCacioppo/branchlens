@@ -1,0 +1,63 @@
+# Installs the branchlens package from src/ with a `branchlens` command:
+#   pipx install .    or    uv tool install .
+# `python -m branchlens` starts it too. The `branchlens` file at the top of
+# the repository is a launcher for running from a clone without installing.
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "branchlens"
+version = "0.3.0"
+description = "Watch what your coding agent is changing, live: a read-only browser view of every branch and worktree, uncommitted work included, in plain words. Zero dependencies."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+dependencies = []
+keywords = [
+    "git",
+    "diff",
+    "diff-viewer",
+    "branch",
+    "worktree",
+    "code-review",
+    "coding-agent",
+    "claude-code",
+]
+classifiers = [
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+
+[project.urls]
+Homepage = "https://github.com/AndreaCacioppo/branchlens"
+Source = "https://github.com/AndreaCacioppo/branchlens"
+Issues = "https://github.com/AndreaCacioppo/branchlens/issues"
+
+[project.scripts]
+branchlens = "branchlens.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["branchlens"]
+
+[tool.setuptools.package-data]
+branchlens = ["static/app.html"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100

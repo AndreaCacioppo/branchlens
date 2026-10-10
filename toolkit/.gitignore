@@ -1,0 +1,6 @@
+.preflight/
+target/
+node_modules/
+.m2/
+# Semgrep registry rules are licensed for internal use only: never commit them
+checks/semgrep-rules/vendored-*.yaml

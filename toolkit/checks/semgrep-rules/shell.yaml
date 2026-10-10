@@ -1,0 +1,100 @@
+# LOCAL rules for shell scripts (bash, and sh/zsh/ksh read as bash).
+#
+# The gate gives every shell script a name semgrep reads as bash: .sh and
+# .bash files as they are, .zsh, .ksh, .sbatch, .slurm, .pbs (batch jobs)
+# and scripts without an extension whose #! line names a shell with ".sh"
+# appended in the scan tree only (see semgrep_scan_name in checks/gate.py).
+#
+# Every finding of a local rule blocks the gate. A shell file semgrep could
+# only partly parse, or that is not UTF-8 (the text rules below can miss
+# lines in it), is named in the "Code without scanner rules" row, a caveat.
+#
+# The eval, rm and chmod rules match a command where one starts: at the
+# start of a line, after ; & | or (, or after then, do or else. A comment
+# or an echo that mentions the command is not flagged.
+
+rules:
+  - id: shell-download-piped-to-shell
+    languages: [bash]
+    severity: ERROR
+    message: >
+      Code downloaded and run in one step: whoever controls the URL, the
+      server or the network runs commands here. Download to a file, check
+      its checksum or signature, then run it.
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: curl ... | $SHELL ...
+              - pattern: wget ... | $SHELL ...
+              - pattern: curl ... | sudo $SHELL ...
+              - pattern: wget ... | sudo $SHELL ...
+              - pattern: $SHELL <(curl ...)
+              - pattern: $SHELL <(wget ...)
+              - pattern: $SHELL -c "$(curl ...)"
+              - pattern: $SHELL -c "$(wget ...)"
+          - metavariable-regex:
+              metavariable: $SHELL
+              regex: ^(sh|bash|zsh|ksh|dash)$
+      - pattern: eval "$(curl ...)"
+      - pattern: eval "$(wget ...)"
+      - pattern: source <(curl ...)
+      - pattern: source <(wget ...)
+
+  # A variable expansion anywhere in the evaluated text is flagged. A
+  # command substitution with no variable in it (eval "$(ssh-agent -s)",
+  # eval "$(conda shell.bash hook)") runs fixed output and is not; one that
+  # downloads is the rule above. "eval set --" is the argument re-splitting
+  # idiom of the Gradle and Maven wrapper scripts. Not flagged either: the
+  # lines conda init and micromamba write, eval "$__conda_setup" and
+  # eval "$("$CONDA_EXE" shell.bash hook)".
+  - id: shell-eval-of-variable
+    languages: [bash]
+    severity: ERROR
+    message: >
+      eval runs text built from a variable as code: if any part of that
+      value can come from outside the script (an argument, the environment,
+      a file, a command's output), it is command injection. Call the
+      command directly with its arguments in an array instead.
+    patterns:
+      - pattern-regex: (?m)(?:^|[;&|(]|\bthen|\bdo|\belse)[ \t]*eval(?![ \t]+"\$__(?:conda|mamba)_setup"|[ \t]+"\$\([ \t]*"?\$\{?(?:CONDA|MAMBA)_EXE\}?"?[ \t]+shell\b[^\n]*\bhook\b)[ \t]+[^\n#]*\$\{?[A-Za-z_0-9@*]
+      - pattern-not-regex: (?m)eval[ \t]+["']?set[ \t]+--
+
+  # rm -r (-R, --recursive) whose path starts with a variable, named or
+  # positional ($1, $@): unquoted, it is split and globbed; quoted but
+  # followed by "/", an empty or unset variable turns "$DIR/"* into /*.
+  # "${DIR:?}" stops the script when DIR is empty, and $HOME and $PWD are
+  # always set. rm -rf "$@" (quoted, no "/") is not flagged.
+  - id: shell-rm-rf-variable-path
+    languages: [bash]
+    severity: ERROR
+    message: >
+      Recursive rm on a path that starts with a variable: if the variable is
+      empty or unset the path becomes the root (rm -rf "$DIR/"* deletes /*),
+      and unquoted it is split on spaces and globbed. Write "${DIR:?}/" so
+      the script stops when DIR is empty, and quote it.
+    pattern-regex: (?m)(?:^|[;&|(]|\bthen|\bdo|\belse)[ \t]*(?:sudo[ \t]+)?rm[ \t]+(?:(?:-[A-Za-z]+|--[a-z][a-z-]*)[ \t]+)*?(?:-[A-Za-z]*[rR][A-Za-z]*|--recursive)[ \t]+(?:(?:-[A-Za-z]+|--[a-z][a-z-]*)[ \t]+)*(?:--[ \t]+)?(?:\$\{?(?:[0-9]+|[@*#]|(?!(?:HOME|PWD)(?![A-Za-z0-9_]))[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_]))(?!:?\?)|"\$\{?(?:[0-9]+|[@*#]|(?!(?:HOME|PWD)(?![A-Za-z0-9_]))[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_]))(?!:?\?)\}?"?/)
+
+  # Also matched after find -exec and xargs.
+  - id: shell-chmod-world-writable
+    languages: [bash]
+    severity: WARNING
+    message: >
+      chmod 777 (or a+rwx) lets every user on the machine replace or edit
+      the file, or plant files in the directory. Grant only what is needed
+      (755 for a program, 700 or 750 for a private directory).
+    pattern-regex: (?m)(?:^|[;&|(]|\bthen|\bdo|\belse|-exec|\bxargs(?:[ \t]+-[A-Za-z0-9]+)*)[ \t]*(?:sudo[ \t]+)?chmod[ \t]+(?:--?[A-Za-z][A-Za-z-]*[ \t]+)*(?:0?777|a\+rwx|ugo\+rwx)(?![0-7])
+
+  # The variable name ends in PASSWORD, PASSWD, _PASS, SECRET, SECRET_KEY,
+  # TOKEN, API_KEY or ACCESS_KEY and gets a literal of 4 or more
+  # characters. Not flagged: a value built from $ or a command, a switch
+  # (true, false, yes, no, none, null, on, off, 0, 1, empty; quoted or
+  # not), and a placeholder (test, testing, fake, password, secret as the
+  # whole value; changeme, example, your_..., xxxx, <...>).
+  - id: shell-hardcoded-secret
+    languages: [bash]
+    severity: ERROR
+    message: >
+      A password or token written into the script: anyone who can read the
+      repository can use it, and it stays in the git history. Read it from
+      the environment or a file outside the repository.
+    pattern-regex: (?m)^[ \t]*(?:export[ \t]+|local[ \t]+|readonly[ \t]+|declare[ \t]+(?:-[A-Za-z]+[ \t]+)*)?[A-Za-z0-9_]*(?i:password|passwd|_pass|secret|secret_?key|token|api_?key|access_?key)=(?!["']?(?i:(?:true|false|yes|no|none|null|on|off|0|1|empty|test|testing|fake|password|secret)["']?(?:[\s;&|)]|$)|changeme|change-me|example|placeholder|dummy|your[_-]|xxxx|<))(?:"[^"$`\n]{4,}"|'[^'\n]{4,}'|[^\s"'$`;&|()]{4,})

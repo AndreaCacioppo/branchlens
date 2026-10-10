@@ -1,0 +1,209 @@
+# LOCAL security rules for the slim gate. They need no network and no build:
+# together with xss-dom.yaml they are the whole Semgrep configuration.
+#
+# They replace the heaviest scanners of the old gate (the registry ruleset,
+# which needed a download on every run, and SpotBugs, which needed a full
+# Maven build) for the vulnerability classes that matter most here: SQL
+# injection, command injection, weak hashing, XXE, path traversal, dangerous
+# dynamic code. Like the XSS rules, they report the dangerous SINK — their
+# job is to make a human look at that exact spot, not to prove exploitability.
+#
+# The gate runs them on the CHANGED FILES ONLY, at HEAD and at the base
+# commit, and reports only the findings that are new at HEAD: a pre-existing
+# sink in a file you touched does not block you.
+
+rules:
+  # ---- Java ----------------------------------------------------------------
+
+  # A note on the "$A + $B" rules: Java parses a chain like lit + var + lit
+  # as (lit + var) + lit, so filtering on a single operand would miss chains
+  # that merely END with a literal. Instead the pattern-not clauses exclude
+  # exactly the concatenation made ONLY of two literals (a formatting habit
+  # in legacy code), and everything else stays reported.
+  - id: java-sql-string-concat
+    languages: [java]
+    severity: ERROR
+    message: >
+      SQL built by string concatenation and executed: SQL injection if any
+      concatenated piece can be influenced by a user. Use a PreparedStatement
+      with ? parameters.
+    patterns:
+      - pattern-either:
+          - pattern: $STMT.executeQuery($A + $B)
+          - pattern: $STMT.executeUpdate($A + $B)
+          - pattern: $STMT.execute($A + $B)
+          - pattern: $CONN.prepareStatement($A + $B)
+      - pattern-not: $STMT.executeQuery("..." + "...")
+      - pattern-not: $STMT.executeUpdate("..." + "...")
+      - pattern-not: $STMT.execute("..." + "...")
+      - pattern-not: $CONN.prepareStatement("..." + "...")
+
+  - id: java-command-injection
+    languages: [java]
+    severity: ERROR
+    message: >
+      Command executed from a non-literal value: command injection if the
+      value can be influenced by a user. Use a fixed command with a String[]
+      argument list, and validate every variable part.
+    patterns:
+      - pattern-either:
+          - pattern: Runtime.getRuntime().exec($CMD)
+          - pattern: new ProcessBuilder($CMD)
+      - metavariable-pattern:
+          metavariable: $CMD
+          patterns:
+            - pattern-not: "\"...\""
+            - pattern-not: "\"...\" + \"...\""
+
+  - id: java-weak-hash
+    languages: [java]
+    severity: WARNING
+    message: >
+      MD5/SHA-1 are broken for any security purpose (passwords, signatures,
+      integrity). Use SHA-256 or stronger; for passwords use bcrypt/argon2.
+    pattern-either:
+      - pattern: MessageDigest.getInstance("MD5")
+      - pattern: MessageDigest.getInstance("SHA1")
+      - pattern: MessageDigest.getInstance("SHA-1")
+
+  - id: java-xxe-parser
+    languages: [java]
+    severity: WARNING
+    message: >
+      XML parser factory created without disabling external entities (XXE):
+      if this parses XML that a user can supply, external entities can read
+      local files. Set FEATURE_SECURE_PROCESSING and disallow-doctype-decl
+      on the factory before use.
+    patterns:
+      - pattern-either:
+          - pattern: DocumentBuilderFactory.newInstance()
+          - pattern: SAXParserFactory.newInstance()
+          - pattern: XMLInputFactory.newInstance()
+      - pattern-not-inside: |
+          $TYPE $F = $FACTORY.newInstance();
+          ...
+          $F.setFeature(...);
+
+  - id: java-path-from-concat
+    languages: [java]
+    severity: WARNING
+    message: >
+      File path built by concatenation: path traversal if a piece can be
+      influenced by a user ("../"). Resolve against a fixed base directory
+      and verify the normalized result stays inside it.
+    pattern-either:
+      - pattern: new File($A + $B)
+      - pattern: new FileInputStream($A + $B)
+      - pattern: new FileOutputStream($A + $B)
+      - pattern: Paths.get($A + $B)
+
+  - id: java-hardcoded-password
+    languages: [java]
+    severity: WARNING
+    message: >
+      A password or secret written in the source code ends up in git history
+      and in every copy of the jar. Move it to configuration outside the
+      repository.
+    patterns:
+      - pattern: String $NAME = "...";
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i).*(password|passwd|secret).*
+      - pattern-not: String $NAME = "";
+
+  # ---- JavaScript / TypeScript --------------------------------------------
+
+  - id: js-eval-non-literal
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >
+      eval/new Function on a non-literal value executes it as code: code
+      injection if the value can be influenced by a user.
+    patterns:
+      - pattern-either:
+          - pattern: eval($X)
+          - pattern: new Function($X)
+      - metavariable-pattern:
+          metavariable: $X
+          patterns:
+            - pattern-not: "'...'"
+            - pattern-not: "\"...\""
+
+  - id: js-child-process-concat
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >
+      Shell command built from variables: command injection if a piece can be
+      influenced by a user. Use execFile/spawn with an argument array.
+    pattern-either:
+      - pattern: execSync($A + $B)
+      - pattern: execSync(`...${...}...`)
+      - pattern: require('child_process').exec($A + $B)
+      - pattern: require('child_process').exec(`...${...}...`)
+
+  # ---- Python --------------------------------------------------------------
+
+  - id: py-subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: >
+      subprocess with shell=True and a non-literal command: command injection
+      if the value can be influenced by a user. Pass a list of arguments and
+      drop shell=True.
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.run($CMD, ..., shell=True, ...)
+          - pattern: subprocess.Popen($CMD, ..., shell=True, ...)
+          - pattern: subprocess.call($CMD, ..., shell=True, ...)
+          - pattern: subprocess.check_output($CMD, ..., shell=True, ...)
+      - metavariable-pattern:
+          metavariable: $CMD
+          patterns:
+            - pattern-not: "'...'"
+            - pattern-not: "\"...\""
+
+  - id: py-eval-exec
+    languages: [python]
+    severity: ERROR
+    message: >
+      eval/exec on a non-literal value executes it as code: code injection if
+      the value can be influenced by a user.
+    patterns:
+      - pattern-either:
+          - pattern: eval($X)
+          - pattern: exec($X)
+      - metavariable-pattern:
+          metavariable: $X
+          patterns:
+            - pattern-not: "'...'"
+            - pattern-not: "\"...\""
+
+  - id: py-yaml-unsafe-load
+    languages: [python]
+    severity: WARNING
+    message: >
+      yaml.load without a safe loader can instantiate arbitrary objects from
+      the document. Use yaml.safe_load.
+    patterns:
+      - pattern: yaml.load($X)
+      - pattern-not: yaml.load($X, Loader=yaml.SafeLoader)
+
+  - id: py-pickle-load
+    languages: [python]
+    severity: WARNING
+    message: >
+      Unpickling data executes code embedded in it: never unpickle anything a
+      user (or the network) can supply. Prefer JSON for data interchange.
+    pattern-either:
+      - pattern: pickle.load($X)
+      - pattern: pickle.loads($X)
+
+  - id: py-weak-hash
+    languages: [python]
+    severity: WARNING
+    message: >
+      MD5/SHA-1 are broken for any security purpose. Use hashlib.sha256 or
+      stronger; for passwords use bcrypt/argon2.
+    pattern-either:
+      - pattern: hashlib.md5(...)
+      - pattern: hashlib.sha1(...)

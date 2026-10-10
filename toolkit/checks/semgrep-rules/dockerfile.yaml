@@ -1,0 +1,47 @@
+# LOCAL rules for Dockerfiles and Containerfiles.
+#
+# Semgrep reads a file as a Dockerfile when it is named Dockerfile or
+# *.dockerfile; the gate gives Containerfile and Dockerfile.* that suffix in
+# the scan tree only (see semgrep_scan_name in checks/gate.py).
+#
+# Every finding of a local rule blocks the gate. A Dockerfile semgrep could
+# only partly parse, or that is not UTF-8 (the text rules below can miss
+# lines in it), is named in the "Code without scanner rules" row, a caveat.
+
+rules:
+  - id: dockerfile-download-piped-to-shell
+    languages: [dockerfile]
+    severity: ERROR
+    message: >
+      The image build downloads code and runs it in one step: whoever
+      controls the URL, the server or the network decides what goes into
+      the image. Download to a file, check its checksum, then run it.
+    pattern-regex: (?im)^[ \t]*RUN[ \t][^\n]*?\b(?:curl|wget)\b[^\n|]*\|[ \t]*(?:sudo[ \t]+)?(?:sh|bash|zsh|ash|dash)\b
+
+  - id: dockerfile-add-from-url
+    languages: [dockerfile]
+    severity: WARNING
+    message: >
+      ADD with a URL puts whatever the server returns into the image,
+      unchecked. Pass --checksum=sha256:<digest>, or download it with
+      curl in a RUN step and verify it.
+    patterns:
+      - pattern-regex: (?im)^[ \t]*ADD[ \t]+(?:--[A-Za-z-]+(?:=[^ \t\n]+)?[ \t]+)*https?://
+      - pattern-not-regex: (?im)^[ \t]*ADD[ \t][^\n]*--checksum=
+
+  # ENV KEY=value, ENV KEY value (the older form) and ARG KEY=default, where
+  # KEY ends in PASSWORD, PASSWD, _PASS, SECRET, SECRET_KEY, TOKEN, API_KEY
+  # or ACCESS_KEY and the value is a literal of 4 or more characters. Not
+  # flagged: a $VARIABLE, a switch (true, false, yes, no, none, null, on,
+  # off, 0, 1, empty; quoted or not), and a placeholder (test, testing,
+  # fake, password, secret as the whole value; changeme, example, your_...,
+  # xxxx, <...>). The (?!...) before the value skips a switch or
+  # a placeholder for its own pair only, not for the rest of the line.
+  - id: dockerfile-secret-in-env-or-arg
+    languages: [dockerfile]
+    severity: ERROR
+    message: >
+      A password or token baked into the image: ENV and ARG values are kept
+      in the image metadata, where anyone who can pull the image reads
+      them. Pass it at run time, or use a build secret (RUN --mount=type=secret).
+    pattern-regex: (?im)^[ \t]*(?:ENV|ARG)[ \t]+(?:[^\n]*[ \t])?[A-Za-z0-9_]*(?:password|passwd|_pass|secret|secret_?key|token|api_?key|access_?key)(?:=|[ \t]+)(?!["']?(?:(?:true|false|yes|no|none|null|on|off|0|1|empty|test|testing|fake|password|secret)["']?(?:\s|$)|changeme|change-me|example|placeholder|dummy|your[_-]|xxxx|<))(?:"[^"$\n]{4,}"|'[^'\n]{4,}'|[^\s"'$\\]{4,})

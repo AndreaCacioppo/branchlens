@@ -1,0 +1,149 @@
+# LOCAL rules for configuration that can switch on dangerous behaviour:
+# GitLab CI pipelines, Docker Compose files, Spring Boot configuration,
+# Android manifests, Maven POMs and Makefiles.
+#
+# Every rule matches text (language: generic) and is limited by `paths:` to
+# the file names the gate gives that type (gate.py code_language), so no
+# other file is read by them. Every finding of a local rule blocks the gate.
+
+rules:
+  # GitLab expands $CI_... variables in the job's shell, so a commit
+  # message or a merge request title reaches eval or sh -c as code.
+  - id: gitlab-ci-untrusted-variable-run-as-code
+    languages: [generic]
+    severity: ERROR
+    message: >
+      A value an outsider writes (a commit message, a merge request title or
+      description, a branch name) is run as a command through eval or sh -c:
+      whoever writes that text runs commands in the pipeline, with its
+      variables and tokens. Use the value as data ("$CI_COMMIT_MESSAGE" in
+      quotes, as an argument), never as a command.
+    paths:
+      include:
+        - ".gitlab-ci.yml"
+        - "*.gitlab-ci.yml"
+    pattern-regex: (?m)^[^#\n]*(?:\beval\b|\b(?:ba|z|da)?sh[ \t]+-c\b)[^\n]*\$\{?CI_(?:COMMIT_MESSAGE|COMMIT_TITLE|COMMIT_DESCRIPTION|COMMIT_TAG_MESSAGE|COMMIT_BRANCH|COMMIT_REF_NAME|COMMIT_REF_SLUG|COMMIT_AUTHOR|MERGE_REQUEST_TITLE|MERGE_REQUEST_DESCRIPTION|MERGE_REQUEST_SOURCE_BRANCH_NAME)\b
+
+  - id: gitlab-ci-download-piped-to-shell
+    languages: [generic]
+    severity: ERROR
+    message: >
+      A script downloaded and piped straight into a shell runs whatever the
+      server sends that day, with the pipeline's variables and tokens.
+      Download it, check its checksum, then run it.
+    paths:
+      include:
+        - ".gitlab-ci.yml"
+        - "*.gitlab-ci.yml"
+    # curl at the start of a command: a script line, a script: value, or
+    # after && || ;
+    pattern-regex: (?m)^[ \t]*(?:-[ \t]+)?(?:[A-Za-z_]+[ \t]*:[ \t]+)?(?:[^\n"'#]*?(?:&&|\|\||;)[ \t]*)?(?:sudo[ \t]+)?(?:curl|wget)\b[^\n|#]*\|[ \t]*(?:sudo[ \t]+)?(?:ba|z|da|k)?sh\b
+
+  # A privileged container, or one holding the Docker socket, controls the
+  # host it runs on.
+  - id: compose-privileged-container
+    languages: [generic]
+    severity: ERROR
+    message: >
+      privileged: true gives the container every device and capability of
+      the host: code that escapes the application owns the machine. Grant
+      only the capabilities it needs (cap_add) instead.
+    paths:
+      include:
+        - "docker-compose*.yml"
+        - "docker-compose*.yaml"
+        - "compose*.yml"
+        - "compose*.yaml"
+    pattern-regex: (?m)^[ \t]*privileged[ \t]*:[ \t]*["']?true["']?[ \t]*(?:#.*)?$
+
+  - id: compose-docker-socket-mounted
+    languages: [generic]
+    severity: ERROR
+    message: >
+      Mounting /var/run/docker.sock lets the container start other
+      containers on the host as root, which is root on the host; mounting it
+      read-only does not change that. Mount it only into a tool that needs
+      it.
+    paths:
+      include:
+        - "docker-compose*.yml"
+        - "docker-compose*.yaml"
+        - "compose*.yml"
+        - "compose*.yaml"
+    pattern-regex: (?m)^[ \t]*(?:-[ \t]*)?(?:source[ \t]*:[ \t]*)?["']?/var/run/docker\.sock\b
+
+  # Spring Boot actuator endpoints include heapdump, env and loggers: with
+  # all of them exposed over HTTP a caller can read secrets from memory.
+  - id: spring-actuator-exposes-every-endpoint
+    languages: [generic]
+    severity: ERROR
+    message: >
+      management.endpoints.web.exposure.include=* publishes every actuator
+      endpoint over HTTP, heapdump and env included: anyone who reaches them
+      can read passwords and tokens from the running application. List only
+      the endpoints needed (health,info).
+    paths:
+      include:
+        - "application*.properties"
+        - "application*.yml"
+        - "application*.yaml"
+        - "bootstrap*.properties"
+        - "bootstrap*.yml"
+        - "bootstrap*.yaml"
+    pattern-either:
+      - pattern-regex: (?m)^[ \t]*management\.endpoints\.web\.exposure\.include[ \t]*[=:][ \t]*["']?\*
+      - pattern-regex: (?m)^[ \t]*exposure[ \t]*:[ \t]*\n[ \t]+include[ \t]*:[ \t]*["']?\*
+
+  - id: android-debuggable-build
+    languages: [generic]
+    severity: ERROR
+    message: >
+      android:debuggable="true" in the manifest lets anyone with a USB cable
+      attach a debugger to the installed app and read its data. Leave it
+      out: the build tools set it for debug builds only.
+    paths:
+      include:
+        - "AndroidManifest.xml"
+    pattern-regex: android:debuggable[ \t]*=[ \t]*"true"
+
+  - id: android-cleartext-traffic
+    languages: [generic]
+    severity: ERROR
+    message: >
+      android:usesCleartextTraffic="true" lets the app talk plain HTTP, so
+      anyone on the same network can read and change its traffic. Use HTTPS,
+      or allow cleartext for one test host in a network security config.
+    paths:
+      include:
+        - "AndroidManifest.xml"
+    pattern-regex: android:usesCleartextTraffic[ \t]*=[ \t]*"true"
+
+  # A repository reached over plain HTTP can be swapped on the way: the
+  # build then runs whatever code arrives.
+  - id: maven-repository-over-http
+    languages: [generic]
+    severity: ERROR
+    message: >
+      A Maven repository reached over plain http:// can have its jars
+      replaced on the way, and the build runs them. Use https:// (Maven 3.8
+      blocks http repositories for this reason).
+    paths:
+      include:
+        - "pom.xml"
+    pattern-regex: (?s)<(repository|pluginRepository|snapshotRepository)>(?:(?!</\1>).)*?<url>[ \t\n]*http://(?!localhost\b|127\.0\.0\.1\b)
+
+  - id: makefile-download-piped-to-shell
+    languages: [generic]
+    severity: ERROR
+    message: >
+      A recipe that pipes a download straight into a shell runs whatever the
+      server sends that day on every machine that builds the project.
+      Download it, check its checksum, then run it.
+    paths:
+      include:
+        - "Makefile"
+        - "makefile"
+        - "GNUmakefile"
+        - "*.mk"
+    # curl at the start of a recipe command, or after && || ;
+    pattern-regex: (?m)^\t[@+-]*[ \t]*(?:[^\n"'#]*?(?:&&|\|\||;)[ \t]*)?(?:sudo[ \t]+)?(?:curl|wget)\b[^\n|#]*\|[ \t]*(?:sudo[ \t]+)?(?:ba|z|da|k)?sh\b

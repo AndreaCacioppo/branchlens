@@ -1,0 +1,21 @@
+name: Feature request
+description: Something BranchLens should show or do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+      description: The situation, and where BranchLens falls short today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help
+      description: What the page or the command could do instead.
+  - type: input
+    id: branchlens-version
+    attributes:
+      label: branchlens --version
+      placeholder: branchlens 0.1.0

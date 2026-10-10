@@ -1,0 +1,4 @@
+# Leave the test script and the page out of GitHub's language bar, so it
+# shows the Python code.
+test.sh -linguist-detectable
+src/branchlens/static/app.html -linguist-detectable
