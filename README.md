@@ -1,6 +1,6 @@
 # BranchLens
 
-A vibe coded tool to watch your coding agent work live in your browser.
+A vibe coded tool to help you vibe code.
 
 [![CI](https://github.com/AndreaCacioppo/branchlens/actions/workflows/ci.yml/badge.svg)](https://github.com/AndreaCacioppo/branchlens/actions/workflows/ci.yml)
 
