@@ -8603,6 +8603,40 @@ check "push environment: GIT_DIR and GIT_WORK_TREE from the shell do not redirec
 [ "$(git --git-dir="$ENV_PUSH_ORIGIN" rev-parse -q --verify refs/heads/main)" = "$ENV_PUSH_TIP" ]
 check "push environment: the judged commit reached the branch's own remote" $?
 
+# Config in the environment would reach the push but not check_push, which
+# reads the remote without it: a pushurl given there could send the commit
+# to a host --no-push-host blocks. The push drops it.
+ENV_PUSH_ELSEWHERE="$FIXTURE/env-push-elsewhere.git"
+git init -q --bare -b main "$ENV_PUSH_ELSEWHERE"
+set_commit_date "2026-05-01T10:00:00 +0000"
+printf 'second\n' >> "$ENV_PUSH_REPO/file.txt"
+git -C "$ENV_PUSH_REPO" commit -q -am "Second commit"
+ENV_PUSH_TIP2=$(git -C "$ENV_PUSH_REPO" rev-parse HEAD)
+[ "$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.pushurl GIT_CONFIG_VALUE_0="$ENV_PUSH_ELSEWHERE" \
+  git -C "$ENV_PUSH_REPO" remote get-url --push origin)" = "$ENV_PUSH_ELSEWHERE" ]
+check "push environment: in the fixture, git reads a pushurl from GIT_CONFIG_COUNT" $?
+python3 - "$PROJECT_DIR" "$ENV_PUSH_REPO" "$ENV_PUSH_ELSEWHERE" "$ENV_PUSH_TIP2" <<'PY'
+import os
+import sys
+
+from branchlens import publish
+
+repo, elsewhere, tip = sys.argv[2], sys.argv[3], sys.argv[4]
+# As if BranchLens had been started from a shell that sets git config.
+os.environ["GIT_CONFIG_COUNT"] = "1"
+os.environ["GIT_CONFIG_KEY_0"] = "remote.origin.pushurl"
+os.environ["GIT_CONFIG_VALUE_0"] = elsewhere
+os.environ["GIT_CONFIG_PARAMETERS"] = "'remote.origin.pushurl'='" + elsewhere + "'"
+pushed, output = publish.push_branch(repo, "origin", "main", tip, False)
+if not pushed:
+    print(output)
+sys.exit(0 if pushed else 1)
+PY
+check "push environment: git config from the shell does not redirect the push" $?
+[ "$(git --git-dir="$ENV_PUSH_ORIGIN" rev-parse -q --verify refs/heads/main)" = "$ENV_PUSH_TIP2" ] && \
+  [ -z "$(git --git-dir="$ENV_PUSH_ELSEWHERE" for-each-ref)" ]
+check "push environment: the commit reached the remote check_push read, and nothing went elsewhere" $?
+
 # ---- a remote tip the caller already read (g79) -------------------------------------
 # read_push_facts reuses it only for the very ref it resolves, after the
 # upstream lookup: a master tracking origin/main never takes origin/master's.
