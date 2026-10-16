@@ -57,6 +57,13 @@ SSH_SCHEMES = ("ssh", "git+ssh", "ssh+git")
 DEFAULT_PORTS = {"http": 80, "https": 443, "ssh": 22, "git": 9418}
 RUNNING_REASON = "A security check is running: push once it has finished."
 NO_VERDICT_REASON = "The latest security check has no verdict yet."
+NO_FORK_REASON = ("The latest check does not record where the history it judged "
+                  "starts (no review-scope.json or base_ref): run the check again.")
+FORK_DISAGREES_REASON = ("The latest check's records disagree about where the history "
+                         "it judged starts (review-scope.json and base_ref): run the "
+                         "check again.")
+BASE_MISMATCH_REASON = ("The latest check records another base than the one "
+                        "BranchLens started it with: run the check again.")
 
 
 def run_report_folder(reports_root, run_id):
@@ -565,36 +572,11 @@ def has_control_character(text):
     return False
 
 
-def judged_fork_commit(push_directory, folder, verdict, judged_commit):
-    """The commit after which the run's judged history starts, or None when unknown.
-
-    The run judged fork..judged_commit. The fork comes from the run's
-    review-scope.json (fork_commit, written before the checks start), unless
-    that file describes another commit. Without it, verdict.json's base_ref
-    is resolved now the way the toolkit resolved it: the empty tree for
-    "empty-tree", else the merge base of that base and the judged commit.
-    """
-    scope = read_review_scope(folder)
-    if scope is not None:
-        head_commit = scope.get("head_commit")
-        fork_commit = scope.get("fork_commit")
-        describes_this_commit = head_commit is None or head_commit == judged_commit
-        if (describes_this_commit and isinstance(fork_commit, str)
-                and FULL_COMMIT_ID.fullmatch(fork_commit)):
-            return fork_commit
-
-    base_ref = verdict.get("base_ref")
-    if not isinstance(base_ref, str) or base_ref in ("", "?"):
-        return None
-    if base_ref == EMPTY_TREE_BASE:
-        return gitops.empty_tree_id(judged_commit)
-    if base_ref.startswith("-") or has_control_character(base_ref):
-        return None
-    base_commit = gitops.read_ref_commit(push_directory, base_ref + "^{commit}")
-    if not FULL_COMMIT_ID.fullmatch(base_commit):
-        return None
+def judged_merge_base(push_directory, base_commit, judged_commit):
+    """The merge base of two commits as the toolkit found it, or None when
+    they have none or git cannot tell."""
     try:
-        fork_commit = gitops.find_merge_base(push_directory, base_commit, judged_commit)
+        fork_commit = gitops.find_judged_merge_base(push_directory, base_commit, judged_commit)
     except gitops.GitError:
         return None
     if not FULL_COMMIT_ID.fullmatch(fork_commit):
@@ -602,7 +584,66 @@ def judged_fork_commit(push_directory, folder, verdict, judged_commit):
     return fork_commit
 
 
-def unjudged_history_problem(push_directory, folder, verdict, remote_name, tip):
+def judged_fork_commit(push_directory, folder, verdict, judged_commit):
+    """(fork, None) for the commit after which the run's judged history starts,
+    or (None, the reason it is unknown).
+
+    The run judged fork..judged_commit. Two records say where that starts:
+    verdict.json's base_ref, and the fork_commit of review-scope.json
+    (written before the checks start) when its head_commit is judged_commit.
+
+    - base_ref "empty-tree": the empty tree (the whole history).
+    - base_ref a full commit id, as in every run BranchLens starts: the
+      merge base of that commit and judged_commit, found again now.
+    - base_ref another name, such as origin/main in a terminal run: the
+      scope's fork, since the name may have moved; without a scope, the
+      merge base the name gives now.
+    - no base_ref: the scope's fork.
+
+    A scope fork that differs from the one base_ref gives is refused, and
+    so is the empty tree under any base_ref but "empty-tree".
+    """
+    empty_tree = gitops.empty_tree_id(judged_commit)
+    scope_fork = None
+    scope = read_review_scope(folder)
+    if scope is not None and scope.get("head_commit") == judged_commit:
+        fork_commit = scope.get("fork_commit")
+        if isinstance(fork_commit, str) and FULL_COMMIT_ID.fullmatch(fork_commit):
+            scope_fork = fork_commit
+
+    base_ref = verdict.get("base_ref")
+    if not isinstance(base_ref, str) or base_ref in ("", "?"):
+        base_ref = None
+
+    if base_ref == EMPTY_TREE_BASE:
+        expected_fork = empty_tree
+    elif base_ref is not None and FULL_COMMIT_ID.fullmatch(base_ref):
+        expected_fork = judged_merge_base(push_directory, base_ref, judged_commit)
+        if expected_fork is None:
+            return None, NO_FORK_REASON
+    else:
+        # A name, or no base_ref at all: the scope's fork, if there is one.
+        if scope_fork == empty_tree:
+            return None, FORK_DISAGREES_REASON
+        if scope_fork is not None:
+            return scope_fork, None
+        if base_ref is None or base_ref.startswith("-") or has_control_character(base_ref):
+            return None, NO_FORK_REASON
+        base_commit = gitops.read_ref_commit(push_directory, base_ref + "^{commit}")
+        if not FULL_COMMIT_ID.fullmatch(base_commit):
+            return None, NO_FORK_REASON
+        expected_fork = judged_merge_base(push_directory, base_commit, judged_commit)
+        if expected_fork is None:
+            return None, NO_FORK_REASON
+        return expected_fork, None
+
+    if scope_fork is not None and scope_fork != expected_fork:
+        return None, FORK_DISAGREES_REASON
+    return expected_fork, None
+
+
+def unjudged_history_problem(push_directory, folder, verdict, remote_name, tip,
+                             started_base=None):
     """Why a push of tip would publish commits the check never judged, or None.
 
     A push sends every commit reachable from tip that the remote lacks. The
@@ -616,11 +657,16 @@ def unjudged_history_problem(push_directory, folder, verdict, remote_name, tip):
     refused unless the whole history was judged. One exception: a single
     push URL that names the same host and path as the single fetch URL,
     over another transport.
+
+    started_base is the base BranchLens handed to preflight.sh when it
+    started this run itself, else None. The verdict must then record that
+    same base.
     """
-    fork_commit = judged_fork_commit(push_directory, folder, verdict, tip)
+    if started_base is not None and verdict.get("base_ref") != started_base:
+        return BASE_MISMATCH_REASON
+    fork_commit, fork_problem = judged_fork_commit(push_directory, folder, verdict, tip)
     if fork_commit is None:
-        return ("The latest check does not record where the history it judged "
-                "starts (no review-scope.json or base_ref): run the check again.")
+        return fork_problem
     if fork_commit == gitops.empty_tree_id(tip):
         return None
     fetch_urls, push_urls = gitops.read_fetch_and_push_urls(push_directory, remote_name)
@@ -650,13 +696,13 @@ def unjudged_history_problem(push_directory, folder, verdict, remote_name, tip):
         commits_text = str(count) + " older commits"
     return ("The check judged only " + fork_commit[:7] + ".." + tip[:7]
             + "; the push would also send " + commits_text + " it never "
-            "judged: run the check against the remote's copy or from the "
-            "empty tree.")
+            "judged: run the check again with no commit picked as its base, "
+            "or compare from the beginning.")
 
 
 def check_push(repo_root, reports_root, run_id, feed_running, feed_verdict_word,
                cancelled_run_id, run_active, active_branch, active_commit,
-               blocked_host_suffixes, feed_findings):
+               blocked_host_suffixes, feed_findings, started_base=None):
     """Decide whether the Push button may be pressed right now.
 
     run_id, feed_running, feed_verdict_word and feed_findings describe the
@@ -666,6 +712,8 @@ def check_push(repo_root, reports_root, run_id, feed_running, feed_verdict_word,
     cancelled_run_id is the feed's run_id at this server's last Cancel.
     run_active, active_branch and active_commit describe a run this server
     started (active_commit: the branch's tip when it started).
+    started_base is the base this server handed to preflight.sh when the
+    feed's latest run is one it started, else None.
 
     Returns the API's `push` fields (allowed, reason, branch, remote,
     commit), `judged` for /api/security, set_upstream and
@@ -682,9 +730,11 @@ def check_push(repo_root, reports_root, run_id, feed_running, feed_verdict_word,
     still its branch's tip; neither the push remote nor origin is on a
     blocked host; the upstream, when the push goes there, has the branch's
     name; the remote-tracking ref of the branch is not already at that
-    commit; and, unless the check judged the whole history, the remote
-    pushes to the one address it fetches from, which already has every
-    commit before the history the check judged.
+    commit; the run's records agree on where its judged history starts
+    (and name the base this server started it with); and, unless the check
+    judged the whole history, the remote pushes to the one address it
+    fetches from, which already has every commit before the history the
+    check judged.
     """
     status = {
         "allowed": False,
@@ -808,7 +858,7 @@ def check_push(repo_root, reports_root, run_id, feed_running, feed_verdict_word,
         return status
 
     unjudged_reason = unjudged_history_problem(push_directory, folder, verdict,
-                                               remote_name, tip)
+                                               remote_name, tip, started_base)
     if unjudged_reason is not None:
         status["reason"] = unjudged_reason
         return status

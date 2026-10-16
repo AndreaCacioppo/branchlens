@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -474,7 +475,9 @@ class BranchLensHandler(BaseHTTPRequestHandler):
         """publish.check_push for the latest run, never raising.
 
         runner is RUNNER.describe()'s answer. Returns the full status dict,
-        set_upstream included.
+        set_upstream included. When this server started the latest run, the
+        base it handed to preflight.sh goes along: the run's own records
+        must then name that base.
         """
         from branchlens import gitops
         from branchlens import publish
@@ -491,6 +494,7 @@ class BranchLensHandler(BaseHTTPRequestHandler):
                 active_commit=RUNNER.started_commit(),
                 blocked_host_suffixes=self.blocked_push_hosts,
                 feed_findings=feed_state.get("findings") or [],
+                started_base=RUNNER.base_of_own_run(feed_state.get("run_id")),
             )
         except gitops.GitError as error:
             return {"allowed": False, "reason": str(error), "branch": None,
@@ -633,7 +637,14 @@ class BranchLensHandler(BaseHTTPRequestHandler):
         return branch_to_worktree.get(branch), branch_tips[branch]
 
     def start_security_run(self, body):
-        """POST /api/run {branch, base?}: start the pipeline on one branch."""
+        """POST /api/run {branch, base?}: start the pipeline on one branch.
+
+        base: a full commit id ("compare from here") or a plain ref name,
+        handed to preflight.sh as a commit id; or "empty-tree" ("compare from
+        the beginning"), handed over as that word, which judges the whole
+        history. Without it, default_run_base() picks the base. The answer,
+        {"started": true, "branch", "base"}, names the base as given.
+        """
         from branchlens import gitops
 
         branch = body.get("branch")
@@ -700,15 +711,24 @@ class BranchLensHandler(BaseHTTPRequestHandler):
             # like the name could win git's lookup.
             toolkit_base = base_commit
         # The run judges merge-base(base, branch)..branch: refuse an empty
-        # range. A first publish judges the whole history instead.
-        if (base_commit is not None
-                and gitops.find_merge_base(self.repo_root, base_commit, tip) == tip):
-            self.send_json(400, {
-                "error": branch + " has no commits that " + base_label + " lacks, so "
-                         "there is nothing to check: the check judges commits, "
-                         "not uncommitted edits."
-            })
-            return
+        # range, and a base with no history in common with the branch, where
+        # the toolkit would stop at once. The empty tree judges the whole
+        # history instead.
+        if base_commit is not None:
+            fork_commit = gitops.find_judged_merge_base(self.repo_root, base_commit, tip)
+            if fork_commit == "":
+                self.send_json(400, {
+                    "error": short_base_name(base_label) + " shares no history with "
+                             + branch + ", so there is no range of commits to check."
+                })
+                return
+            if fork_commit == tip:
+                self.send_json(400, {
+                    "error": branch + " has no commits that " + short_base_name(base_label)
+                             + " lacks, so there is nothing to check: the check judges "
+                             "commits, not uncommitted edits."
+                })
+                return
 
         command = [os.path.join(self.toolkit_path, "preflight.sh"), "run", worktree_path,
                    toolkit_base]
@@ -1327,6 +1347,10 @@ class PipelineRunner:
         self.cancelled_run_id = None  # the feed's latest run_id at that Cancel
         self.exit_code = None        # exit code of the last finished run
         self.log_path = None
+        # The run_id the active or last run's log names, kept once read: the
+        # review's agents can write in the reports folder, log included.
+        self.run_id = None
+        self.run_number = 0          # runs started so far: tells a log read apart from a newer run's
         self.closed = False          # True once the server is stopping: no new run starts
         self.base_argument = None    # the base handed to preflight.sh: a commit id or "empty-tree"
         self.base_label = None       # the name that base was read from ("origin/main")
@@ -1360,13 +1384,16 @@ class PipelineRunner:
                 "unavailable_reason": toolkit_problem,
                 "active": active,
                 "branch": self.branch,
+                # The base of the active or last run, as /api/run's answer
+                # names it. The page needs it before the run's first feed event.
+                "base": self.base_label,
                 "started_utc": self.started_utc,
                 "exit_code": None if active else self.exit_code,
                 "run_id": None,
                 "log_tail": None,
             }
         if log_path is not None:
-            description["run_id"] = read_log_run_id(log_path)
+            description["run_id"] = self.own_run_id()
             description["log_tail"] = read_log_tail(log_path, RUN_LOG_TAIL_LINES)
         return description
 
@@ -1395,10 +1422,37 @@ class PipelineRunner:
             return self.cancelled_run_id
 
     def own_run_id(self):
-        """The run_id of the last run this server started, or None until its log names it."""
+        """The run_id of the last run this server started, or None until its log names it.
+
+        The first run_id read is kept for that run.
+        """
         with self.lock:
+            if self.run_id is not None:
+                return self.run_id
             log_path = self.log_path
-        return read_log_run_id(log_path)
+            run_number = self.run_number
+        run_id = read_log_run_id(log_path)
+        with self.lock:
+            if run_number != self.run_number:
+                # A new run started while the log was read: this was the old log.
+                return None
+            if self.run_id is None and run_id is not None:
+                self.run_id = run_id
+            return self.run_id
+
+    def base_of_own_run(self, feed_run_id):
+        """The base handed to preflight.sh when the feed's latest run is the last run
+        this server started, else None (a run started elsewhere, or none yet)."""
+        with self.lock:
+            run_number = self.run_number
+            base_argument = self.base_argument
+        own_run_id = self.own_run_id()
+        with self.lock:
+            if run_number != self.run_number:
+                return None
+        if own_run_id is None or feed_run_id != own_run_id:
+            return None
+        return base_argument
 
     def base_label_for(self, feed_base):
         """The name of the base a run started here used, when feed_base is its commit id.
@@ -1436,6 +1490,12 @@ class PipelineRunner:
             log_descriptor = os.open(log_path, open_flags, 0o644)
             # The child keeps its own handle on the log file.
             with os.fdopen(log_descriptor, "wb") as log_file:
+                # First line: the exact command. It must stay short:
+                # read_log_run_id looks for the toolkit's "report in:" line
+                # only within RUN_LOG_HEAD_BYTES.
+                log_file.write(("BranchLens runs: " + shlex.join(command) + "\n")
+                               .encode("utf-8", errors="replace"))
+                log_file.flush()
                 # Own process group: Cancel stops the run and all it started,
                 # and a Ctrl+C at BranchLens does not reach it.
                 self.process = subprocess.Popen(
@@ -1452,6 +1512,8 @@ class PipelineRunner:
             self.started_utc = utc_now()
             self.exit_code = None
             self.log_path = log_path
+            self.run_number = self.run_number + 1
+            self.run_id = None
             self.base_argument = base_argument
             self.base_label = base_label
             self.last_push_pushed = None
@@ -1547,6 +1609,14 @@ def default_run_base(repo_root, branch, worktree_path):
         return remote_ref, remote_ref[len("refs/remotes/"):]
     comparison = gitops.find_comparison_ref(repo_root, default_branch)
     return comparison["ref"], gitops.comparison_display_name(default_branch, comparison)
+
+
+def short_base_name(base_label):
+    """A run's base as an error message names it: a full commit id cut to 7
+    characters, any other label (origin/main) as it is."""
+    if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base_label):
+        return base_label[:7]
+    return base_label
 
 
 def is_plain_base_name(base):

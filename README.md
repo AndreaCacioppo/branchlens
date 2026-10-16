@@ -48,9 +48,21 @@ verification of each finding. It takes 5 to 15 minutes, costs Claude usage,
 sends the diff to Claude and runs the branch's code with your rights: use it
 only on repositories you trust.
 
+The base is the one the page shows. By default that is where the branch
+forked from `origin/main`, or, for the default branch, its online copy. A
+commit picked with "compare from here" in Tree limits the run to the commits
+after it. "compare from the beginning", at the bottom of Tree, compares with
+nothing: every commit and every file counts as new, so a branch that is
+already published can be checked whole. Such a run takes longer and also
+reports problems older work left behind.
+
 Push turns on only after a confirmed READY TO PUBLISH run on the branch's
-current tip, and sends only that commit, without tags or submodules.
-`--no-push-host HOST` turns it off for a host.
+current tip, and sends only that commit, without tags or submodules. The run
+must have judged every commit the push would send: after a run from a picked
+commit, Push stays off while the remote lacks older ones, and a run from the
+beginning covers them all. BranchLens never fetches, so what the remote has
+is what the last fetch or push saw. `--no-push-host HOST` turns Push off for
+a host.
 
 `toolkit/preflight.sh check /path/to/repo [base]` runs the scanners alone,
 without Claude (exit 0 passed, 1 failed, 2 inconclusive). Reports go to

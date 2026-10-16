@@ -435,6 +435,38 @@ body {
   font-size: 12px;
   color: var(--muted);
 }
+/* The tree's last entry, "compare from the beginning". Always visible: a
+   touch screen has no hover. renderTree indents it to the subjects' column. */
+.tree-beginning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 4px 10px 12px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 0;
+}
+.beginning-chip {
+  flex: none;
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 6px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  border-radius: 4px;
+  background: transparent;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.beginning-chip:hover { background: var(--hover); }
+.tree-beginning-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ============================== Header bar ================================ */
 #header-bar {
@@ -2405,17 +2437,19 @@ function comparisonLabel(stateBody) {
   return stateBody.default_branch || "";
 }
 
-// The base the toolkit reads as a first publish: compared with nothing, the
-// whole history is judged.
-var FIRST_PUBLISH_BASE = "empty-tree";
+// The base that compares with nothing ("compare from the beginning", and a
+// first publish's default): every file counts as new, and a run judges the
+// whole history. The server and the toolkit read the same word.
+var EMPTY_TREE_BASE = "empty-tree";
 
-// The base a run started from this page uses (the page sends none): for the
-// default branch, nothing on a first publish, else its push remote's copy
-// ("upstream/main"); for any other branch, the comparison ref.
+// The base a run started from this page uses when no base is picked in the
+// Tree (the page then sends none): for the default branch, nothing on a
+// first publish, else its push remote's copy ("upstream/main"); for any
+// other branch, the comparison ref.
 function defaultRunBase(branch) {
   if (branch !== null && branch.is_default && currentState &&
       currentState.first_publish === true) {
-    return FIRST_PUBLISH_BASE;
+    return EMPTY_TREE_BASE;
   }
   if (branch !== null && branch.is_default && currentState &&
       typeof currentState.push_remote === "string") {
@@ -2424,10 +2458,52 @@ function defaultRunBase(branch) {
   return comparisonLabel(currentState);
 }
 
-// Appends a run's base: the ref in monospace, or the words for a first publish.
-function appendRunBase(parent, base) {
-  if (base === FIRST_PUBLISH_BASE) {
-    parent.appendChild(document.createTextNode("nothing (first publish)"));
+// True when a run on this branch from the empty tree is the default
+// branch's first publish: its push remote has no copy of it yet.
+function isFirstPublishRun(branchName) {
+  return currentState !== null && currentState.first_publish === true &&
+    branchName !== null && branchName === currentState.default_branch;
+}
+
+// The subject of a commit in the loaded graph, or null when it is not there.
+function graphCommitSubject(sha) {
+  if (currentGraph === null) {
+    return null;
+  }
+  for (var i = 0; i < currentGraph.commits.length; i++) {
+    if (currentGraph.commits[i].sha === sha) {
+      return currentGraph.commits[i].subject;
+    }
+  }
+  return null;
+}
+
+// A run's base as plain words, for a dialog: "nothing (whole history)" for
+// the empty tree ("nothing (first publish)" on a first publish), a commit
+// by its short id and subject, any other ref by its name.
+function runBaseText(base, branchName) {
+  if (base === EMPTY_TREE_BASE) {
+    return isFirstPublishRun(branchName) ? "nothing (first publish)" : "nothing (whole history)";
+  }
+  if (COMMIT_ID_PATTERN.test(base)) {
+    var subject = graphCommitSubject(base);
+    return base.slice(0, 7) + (subject !== null ? " “" + subject + "”" : "");
+  }
+  return base;
+}
+
+// Appends a run's base, worded as runBaseText words it, with ids and ref
+// names in monospace. branchName is the branch the run checks.
+function appendRunBase(parent, base, branchName) {
+  if (base === EMPTY_TREE_BASE) {
+    parent.appendChild(document.createTextNode(isFirstPublishRun(branchName) ?
+      "nothing (first publish)" : "nothing (whole history)"));
+  } else if (COMMIT_ID_PATTERN.test(base)) {
+    parent.appendChild(makeText("span", "mono", base.slice(0, 7)));
+    var subject = graphCommitSubject(base);
+    if (subject !== null) {
+      parent.appendChild(document.createTextNode(" “" + subject + "”"));
+    }
   } else {
     parent.appendChild(makeText("span", "mono", base));
   }
@@ -3337,6 +3413,35 @@ function renderTree() {
     treeListElement.appendChild(makeText("div", "tree-note",
       "· showing the latest " + shownLimit + " commits ·"));
   }
+  treeListElement.appendChild(makeTreeBeginningEntry(svgWidth));
+}
+
+// The tree's last entry, below the oldest commit and the truncation note:
+// compare with nothing. Not a commit row, so the arrow keys and the
+// selection skip it.
+function makeTreeBeginningEntry(svgWidth) {
+  var entry = makeElement("div", "tree-beginning");
+  // in line with the subjects, right of the graph column
+  entry.style.paddingLeft = (svgWidth + 6) + "px";
+  var explanation = "Compare with nothing: every file and every commit counts as " +
+    "new, and Run judges the whole history.";
+  if (baseSha === EMPTY_TREE_BASE) {
+    entry.appendChild(makeText("span", "base-chip", "base"));
+    var current = makeText("span", "tree-beginning-text",
+      "the beginning: every commit counts as new");
+    current.title = explanation;
+    entry.appendChild(current);
+  } else {
+    var button = makeText("button", "beginning-chip", "compare from the beginning");
+    button.type = "button";
+    button.title = explanation;
+    button.addEventListener("click", function () {
+      setBaseCommit(EMPTY_TREE_BASE);
+    });
+    entry.appendChild(button);
+    entry.appendChild(makeText("span", "tree-beginning-text", "before the first commit"));
+  }
+  return entry;
 }
 
 function updateTreeSelection() {
@@ -3429,11 +3534,13 @@ function refreshGraph() {
 }
 
 function afterGraphRefresh() {
-  if (baseSha !== null && !graphHasSha(baseSha)) {
+  // The empty tree is in no graph: it stays until "stop comparing".
+  if (baseSha !== null && baseSha !== EMPTY_TREE_BASE && !graphHasSha(baseSha)) {
     // the base left the graph: clear it silently, back to plain comparisons
     baseSha = null;
     rememberViewInAddress();
     renderHeader();
+    updateRunCard(); // Run no longer sends that base
     if (hasSelection()) {
       loadDiff();
     }
@@ -3605,6 +3712,7 @@ treeListElement.addEventListener("keydown", function (event) {
 
 /* ============================== Compare base ============================== */
 
+// sha is a commit id, EMPTY_TREE_BASE ("compare from the beginning") or null.
 function setBaseCommit(sha) {
   if (baseSha === sha) {
     return;
@@ -3613,6 +3721,11 @@ function setBaseCommit(sha) {
   rememberViewInAddress();
   renderTreeIfChanged();
   renderHeader(); // the "stop comparing" pill appears right away
+  // Run sends the base the page shows: its card names it right away
+  updateRunCard();
+  if (viewMode === "check") {
+    renderCheckPanel();
+  }
   if (hasSelection()) {
     loadDiff();
   }
@@ -4711,6 +4824,8 @@ function renderDiffBody() {
     var vanishedParts = [{ text: selectedFilePath }];
     if (currentDiff.whole_history === true) {
       vanishedParts.push(" is no longer among the files a push would publish.");
+    } else if (currentDiff.base_empty_tree === true) {
+      vanishedParts.push(" is no longer among the files; it may have been deleted or moved.");
     } else if (currentDiff.base_override) {
       vanishedParts.push(' no longer differs from "' +
         (currentDiff.base_subject || "") +
@@ -7806,7 +7921,7 @@ function renderSecurityBanner() {
     }
     if (feed !== null && feed.base) {
       banner.appendChild(document.createTextNode(", comparing with "));
-      appendRunBase(banner, feed.base);
+      appendRunBase(banner, feed.base, branchName);
     }
   } else if (feed !== null && (view.stopped || feed.verdict || feed.verdict_word)) {
     banner.className = "done";
@@ -7938,17 +8053,29 @@ securityBannerElement.addEventListener("keydown", function (event) {
   }
 });
 
+// Whether the shown run judged from the base picked in the Tree: the empty
+// tree, or the same commit on the shown line of history. A commit on another
+// line is judged from where the two lines meet, which the page does not show.
+function pickedBaseWasJudged(view) {
+  if (view.feed === null || view.feed.base !== baseSha) {
+    return false;
+  }
+  return baseSha === EMPTY_TREE_BASE ||
+    (currentDiff !== null && currentDiff.base_is_ancestor === true);
+}
+
 // Whether the files on screen are the code the shown run judged: its branch
-// at its commit, with a status that reads clean and the usual base, or that
-// commit picked in the Tree. When only the commit is known (a run started
-// outside the page, before its verdict), a branch whose tip is that commit
-// counts. When nothing is known, nothing counts.
+// at its commit, with a status that reads clean and the usual base (or the
+// base the run judged from, picked in the Tree), or that commit picked in
+// the Tree. When only the commit is known (a run started outside the page,
+// before its verdict), a branch whose tip is that commit counts. When
+// nothing is known, nothing counts.
 function selectionIsJudged(view) {
   var judged = judgedRun(view);
   if (judged === null) {
     return false;
   }
-  if (baseSha !== null) {
+  if (baseSha !== null && !pickedBaseWasJudged(view)) {
     return false;
   }
   if (selectedCommitSha !== null) {
@@ -8365,8 +8492,8 @@ function runnerInfo() {
   }
   if (runner === null) {
     return { available: false, unavailableReason: null, active: false,
-             branch: null, startedMs: null, exitCode: null, runId: null,
-             logText: "" };
+             branch: null, base: null, startedMs: null, exitCode: null,
+             runId: null, logText: "" };
   }
   return {
     available: runner.available === true,
@@ -8374,6 +8501,8 @@ function runnerInfo() {
     active: runner.active === true,
     branch: typeof runner.branch === "string" && runner.branch !== "" ?
       runner.branch : null,
+    // the base the server started its last run with, as /api/run named it
+    base: nonEmptyString(runner.base),
     startedMs: parseUtcMs(runner.started_utc),
     exitCode: typeof runner.exit_code === "number" ? runner.exit_code : null,
     runId: nonEmptyString(runner.run_id),
@@ -9980,7 +10109,7 @@ function makeVerdictCard(view, stages, pushArea) {
     context.appendChild(document.createTextNode("Compared with "));
   }
   if (feed.base) {
-    appendRunBase(context, feed.base);
+    appendRunBase(context, feed.base, branchName);
   }
   var startedMs = parseUtcMs(feed.started_utc);
   var lastMs = parseUtcMs(feed.last_utc);
@@ -10452,6 +10581,28 @@ function runButtonState(view, target) {
   return { enabled: true, reason: "" };
 }
 
+// The Run card's hint when Run would find nothing to judge: the default
+// branch, with no commit that its online copy lacks and no base picked in
+// the Tree, is checked against that copy. "" when that is not the case.
+function emptyRangeHint(target) {
+  if (target === null || baseSha !== null || !target.is_default || currentState === null) {
+    return "";
+  }
+  if (currentState.default_synced_online !== true || currentState.first_publish === true) {
+    return "";
+  }
+  // ahead counts against origin's copy; Run's default is the push remote's
+  if (typeof currentState.push_remote === "string" && currentState.push_remote !== "origin") {
+    return "";
+  }
+  if (target.ahead !== 0) {
+    return "";
+  }
+  return target.name + " has no commits that " + defaultRunBase(target) + " lacks, so " +
+    "a check against it has nothing to judge. To check the whole history of " +
+    target.name + ", pick “compare from the beginning” at the bottom of the Tree.";
+}
+
 function buildRunCard() {
   var card = makeElement("section", "run-card");
 
@@ -10482,6 +10633,10 @@ function buildRunCard() {
     "and cannot unlock Push. Commit them (or move them aside) first.");
   note.hidden = true;
   card.appendChild(note);
+  // Shown when the default branch has nothing its online copy lacks (emptyRangeHint).
+  var emptyRangeNote = makeText("div", "console-note", "");
+  emptyRangeNote.hidden = true;
+  card.appendChild(emptyRangeNote);
 
   var actions = makeElement("div", "run-card-actions");
   var runButton = makeText("button", "console-button primary", "Run security check");
@@ -10540,6 +10695,7 @@ function buildRunCard() {
     change: change,
     base: base,
     note: note,
+    emptyRangeNote: emptyRangeNote,
     runButton: runButton,
     cancelButton: cancelButton,
     reason: reason,
@@ -10602,8 +10758,14 @@ function updateRunCardWith(view, stages) {
     runCard.branch.className = "run-card-branch mono";
     runCard.change.hidden = true;
     shownBranch = findBranchInState(runningName);
-    baseLabel = view.feed !== null && view.feed.base ? view.feed.base :
-      (runner.active ? defaultRunBase(shownBranch) : "");
+    if (view.feed !== null && view.feed.base) {
+      baseLabel = view.feed.base;
+    } else if (runner.active) {
+      // before the run's first feed event: the base the server started it with
+      baseLabel = runner.base !== null ? runner.base : defaultRunBase(shownBranch);
+    } else {
+      baseLabel = "";
+    }
   } else {
     setTextIfChanged(runCard.lead, "");
     setTextIfChanged(runCard.branch, target !== null ? target.name : "No branch selected");
@@ -10612,22 +10774,35 @@ function updateRunCardWith(view, stages) {
     runCard.change.hidden = false;
     shownBranch = target;
     baseLabel = defaultRunBase(target);
+    if (baseSha !== null) {
+      baseLabel = baseSha; // Run sends the base picked in the Tree
+    }
   }
   runCard.lead.hidden = runCard.lead.textContent === "";
 
+  var shownBranchName = shownBranch !== null ? shownBranch.name : null;
   var baseKey = baseLabel || "";
-  if (runCard.base.dataset.label !== baseKey) {
-    runCard.base.dataset.label = baseKey;
+  // The words also change with the branch (a first publish) and once the
+  // graph knows a picked commit's subject.
+  var baseCardKey = baseKey === "" ? "" : baseKey + "\u0000" + runBaseText(baseKey, shownBranchName);
+  if (runCard.base.dataset.label !== baseCardKey) {
+    runCard.base.dataset.label = baseCardKey;
     clearNode(runCard.base);
     if (baseKey !== "") {
       runCard.base.appendChild(document.createTextNode("compared with "));
-      appendRunBase(runCard.base, baseKey);
+      appendRunBase(runCard.base, baseKey, shownBranchName);
+      runCard.base.title = "compared with " + runBaseText(baseKey, shownBranchName);
+    } else {
+      runCard.base.title = "";
     }
-    if (baseKey === FIRST_PUBLISH_BASE) {
+    if (baseKey === EMPTY_TREE_BASE && isFirstPublishRun(shownBranchName)) {
       runCard.base.appendChild(document.createTextNode(": the whole history is checked"));
     }
   }
   runCard.note.hidden = !(shownBranch !== null && shownBranch.has_uncommitted);
+  var emptyRangeText = view.inProgress ? "" : emptyRangeHint(target);
+  setTextIfChanged(runCard.emptyRangeNote, emptyRangeText);
+  runCard.emptyRangeNote.hidden = emptyRangeText === "";
 
   // Run while idle; Cancel while this server's own run is going. A run
   // started elsewhere cannot be cancelled from here, so Run stays, disabled.
@@ -10754,6 +10929,24 @@ var RUN_CONSENT_LINES = [
   "- You can cancel it at any time."
 ];
 
+// More lines for Run's confirm dialog when the base needs them: what judging
+// from nothing means, and how a commit on another line of history is used.
+function runBaseConsentLines(base, target) {
+  if (base === EMPTY_TREE_BASE) {
+    return "\n- Compared with nothing, every commit and every file of " + target.name +
+      " counts as new: the run takes longer and also reports problems older " +
+      "work left behind.";
+  }
+  if (COMMIT_ID_PATTERN.test(base) && selectedBranchName === target.name &&
+      currentDiff !== null && currentDiff.base_override === true &&
+      currentDiff.base_is_ancestor === false) {
+    return "\n- " + base.slice(0, 7) + " is not on the line of history of " + target.name +
+      ": the check judges the commits of " + target.name + " since the point where " +
+      "the two lines meet.";
+  }
+  return "";
+}
+
 function startRun() {
   var view = buildRunView();
   var target = targetBranch();
@@ -10761,13 +10954,18 @@ function startRun() {
   if (!state.enabled) {
     return;
   }
+  // The base the page shows: a commit or the empty tree picked in the Tree,
+  // else the default the Run card names.
+  var base = baseSha !== null ? baseSha : defaultRunBase(target);
+  var comparedWith = "compared with " + runBaseText(base, target.name);
   // asks first, so a click begun on another page cannot start a run
   var question = typeof state.stalledMinutes === "number" ?
     "A check started outside this page has reported nothing for " +
       state.stalledMinutes + " min. Start a new security check on " +
-      target.name + " anyway?" :
-    "Run the security check on " + target.name + "?";
-  question = question + "\n\n" + RUN_CONSENT_LINES.join("\n");
+      target.name + ", " + comparedWith + ", anyway?" :
+    "Run the security check on " + target.name + ", " + comparedWith + "?";
+  question = question + "\n\n" + RUN_CONSENT_LINES.join("\n") +
+    runBaseConsentLines(base, target);
   if (!window.confirm(question)) {
     return;
   }
@@ -10775,8 +10973,12 @@ function startRun() {
   pendingActionDoneAt = null;
   runMessage = "";
   updateRunCard();
-  // No base is sent: the server uses the comparison this page already shows.
+  // Only a base picked in the Tree is sent; without one, the server picks
+  // the default that defaultRunBase names.
   var body = { branch: target.name };
+  if (baseSha !== null) {
+    body.base = baseSha;
+  }
   if (typeof state.stalledMinutes === "number") {
     // the user confirmed; the server measures the silence again itself
     body.override_stalled = true;
@@ -11375,6 +11577,8 @@ function openStartingView() {
   if (saved !== null) {
     if (saved.base !== null && COMMIT_ID_PATTERN.test(saved.base)) {
       baseSha = saved.base; // dropped again when it is no longer in the history
+    } else if (saved.base === EMPTY_TREE_BASE) {
+      baseSha = EMPTY_TREE_BASE;
     }
     // The Check tab exists only when the server has a feed or a toolkit; if
     // the answer is not in yet, the tab leaves again when it says no.
