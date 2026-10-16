@@ -809,6 +809,62 @@ expect_get "$SERVER_PORT" "$ERR" "/api/diff?commit=$MERGE_SHA&base=$BLOB_SHA" "4
 
 expect_get "$SERVER_PORT" "$ERR" "/api/diff?branch=main&commit=$MERGE_SHA&base=$ROOT_SHA" "400" "branch= and commit= together still return HTTP 400 when base= rides along"
 
+# ---------------------------------------------------------------- compare from the beginning (base=empty-tree)
+# The word empty-tree compares with nothing: every file is added, so a
+# branch or a commit shows its whole tree. The page's "compare from the
+# beginning" sends it.
+
+EMPTY_TREE_ID=$(git -C "$REPO" hash-object -t tree /dev/null)
+DIFF_EMPTY="$FIXTURE/diff-empty-tree.json"
+expect_get "$SERVER_PORT" "$DIFF_EMPTY" "/api/diff?branch=feature-worktree&base=empty-tree" "200" "empty-tree base: /api/diff?branch= returns HTTP 200"
+json_check "empty-tree base: a checked-out branch lists every file as added, its uncommitted edit and untracked file included" "$DIFF_EMPTY" \
+  '[(f["path"], f["status"], f["adds"], f["dels"], f["untracked"]) for f in data["files"]] == [("alpha.txt", "A", 7, 0, False), ("docs/gone.txt", "A", 1, 0, False), ("scratch.txt", "A", 3, 0, True), ("src/app.py", "A", 2, 0, False), ("src/oldname.py", "A", 10, 0, False), ("wt-committed.txt", "A", 1, 0, False)]'
+json_check "empty-tree base: the answer marks a comparison with nothing, never a first publish" "$DIFF_EMPTY" \
+  'data["mode"] == "worktree" and data["base_override"] is True and data["base_empty_tree"] is True and data["base_subject"] is None and data["base_is_ancestor"] is True and data["base_is_descendant"] is False and data["base_commit"] is None and "whole_history" not in data and data["total_adds"] == 24 and data["total_dels"] == 0'
+json_check "empty-tree base: the explanation says what the list holds" "$DIFF_EMPTY" \
+  'data["explanation"] == "Everything on feature-worktree, compared with nothing (its whole history), including edits not yet committed."'
+expect_get "$SERVER_PORT" "$FILE_RESP" "/api/file?branch=feature-worktree&path=alpha.txt&base=empty-tree" "200" "empty-tree base: /api/file?branch= returns HTTP 200"
+json_check "empty-tree base: a file's patch adds every line, the uncommitted edit included" "$FILE_RESP" \
+  'data["status"] == "A" and data["binary"] is False and "--- /dev/null" in data["patch"] and "+line1\n" in data["patch"] and "+UNCOMMITTED EDIT" in data["patch"] and data["base_is_ancestor"] is True'
+expect_get "$SERVER_PORT" "$FILE_RESP" "/api/file?branch=feature-worktree&path=scratch.txt&base=empty-tree" "200" "empty-tree base: an untracked file's patch returns HTTP 200"
+
+expect_get "$SERVER_PORT" "$DIFF_EMPTY" "/api/diff?branch=feature-committed&base=empty-tree" "200" "empty-tree base: a branch checked out nowhere returns HTTP 200"
+NUMSTAT_EMPTY_COMMITTED=$(git -C "$REPO" diff -M --numstat "$EMPTY_TREE_ID" refs/heads/feature-committed)
+json_check "empty-tree base: a branch checked out nowhere lists its committed tree, as git diff from the empty tree does" "$DIFF_EMPTY" \
+  'data["mode"] == "committed" and all(f["status"] == "A" for f in data["files"]) and sorted([f["path"], f["adds"], f["dels"]] for f in data["files"]) == sorted([r.split("\t")[2], None if r.split("\t")[0] == "-" else int(r.split("\t")[0]), None if r.split("\t")[1] == "-" else int(r.split("\t")[1])] for r in extra.strip().split("\n"))' "$NUMSTAT_EMPTY_COMMITTED"
+json_check "empty-tree base: a branch checked out nowhere has no edits to mention" "$DIFF_EMPTY" \
+  'data["explanation"] == "Everything on feature-committed, compared with nothing (its whole history)." and [f["binary"] for f in data["files"] if f["path"] == "docs/image.bin"] == [True]'
+
+expect_get "$SERVER_PORT" "$DIFF_EMPTY" "/api/diff?commit=$MERGE_SHA&base=empty-tree" "200" "empty-tree base: /api/diff?commit= returns HTTP 200"
+NUMSTAT_EMPTY_MERGE=$(git -C "$REPO" diff -M --numstat "$EMPTY_TREE_ID" "$MERGE_SHA")
+json_check "empty-tree base: a commit lists its whole tree as added, as git diff from the empty tree does" "$DIFF_EMPTY" \
+  'data["mode"] == "range" and all(f["status"] == "A" for f in data["files"]) and sorted([f["path"], f["adds"], f["dels"]] for f in data["files"]) == sorted([r.split("\t")[2], int(r.split("\t")[0]), int(r.split("\t")[1])] for r in extra.strip().split("\n"))' "$NUMSTAT_EMPTY_MERGE"
+json_check "empty-tree base: the commit answer marks a comparison with nothing" "$DIFF_EMPTY" \
+  'data["base_override"] is True and data["base_empty_tree"] is True and data["base_subject"] is None and data["base_is_ancestor"] is True and data["base_is_descendant"] is False and data["explanation"] == "Everything up to \"Merge feature-merged into main\", compared with nothing (its whole history)."'
+expect_get "$SERVER_PORT" "$FILE_RESP" "/api/file?commit=$MERGE_SHA&path=merged.txt&base=empty-tree" "200" "empty-tree base: /api/file?commit= returns HTTP 200"
+json_check "empty-tree base: a commit's file patch adds every line" "$FILE_RESP" \
+  'data["status"] == "A" and data["binary"] is False and "--- /dev/null" in data["patch"] and "+merged work line 1\n+merged work line 2\n" in data["patch"] and data["base_is_ancestor"] is True'
+expect_get "$SERVER_PORT" "$FILE_RESP" "/api/file?commit=$COMMITTED_TIP&path=docs/image.bin&base=empty-tree" "200" "empty-tree base: a binary file of a commit returns HTTP 200"
+json_check "empty-tree base: a binary file of a commit has no patch" "$FILE_RESP" \
+  'data["binary"] is True and data["patch"] == "" and data["status"] == "A"'
+expect_get "$SERVER_PORT" "$FILE_RESP" "/api/file?commit=$ROOT_SHA&path=alpha.txt&base=empty-tree" "200" "empty-tree base: the root commit's file returns HTTP 200"
+json_check "empty-tree base: from the empty tree, the root commit's file is all added" "$FILE_RESP" \
+  'data["patch"].startswith("diff --git a/alpha.txt b/alpha.txt\nnew file mode 100644\n") and "+line5\n" in data["patch"]'
+# A picked commit's file click still says whether the base comes before the
+# commit, now from a listing without line counts.
+expect_get "$SERVER_PORT" "$FILE_RESP" "/api/file?commit=$MERGE_SHA&path=merged.txt&base=$ROOT_SHA" "200" "range file: /api/file?commit=&base= returns HTTP 200"
+json_check "range file: the patch and base_is_ancestor are as before" "$FILE_RESP" \
+  'data["status"] == "A" and "+merged work line 1" in data["patch"] and data["base_is_ancestor"] is True and data["binary"] is False'
+expect_get "$SERVER_PORT" "$FILE_RESP" "/api/file?commit=$COMMITTED_TIP&path=docs/image.bin&base=$ROOT_SHA" "200" "range file: a binary file in a range returns HTTP 200"
+json_check "range file: a binary file in a range is still told apart" "$FILE_RESP" \
+  'data["binary"] is True and data["patch"] == ""'
+
+# Only the word: the empty tree's id, another spelling or a path is no base.
+expect_get "$SERVER_PORT" "$ERR" "/api/diff?branch=feature-worktree&base=$EMPTY_TREE_ID" "404" "empty-tree base: the empty tree's id is no base (HTTP 404)"
+expect_get "$SERVER_PORT" "$ERR" "/api/diff?commit=$MERGE_SHA&base=EMPTY-TREE" "404" "empty-tree base: another spelling is no base (HTTP 404)"
+expect_get "$SERVER_PORT" "$ERR" "/api/file?branch=feature-worktree&path=alpha.txt&base=empty-tree%2F" "404" "empty-tree base: the word with more after it is no base (HTTP 404)"
+expect_get "$SERVER_PORT" "$ERR" "/api/file?commit=$MERGE_SHA&path=not-there.txt&base=empty-tree" "404" "empty-tree base: a path the tree does not hold is HTTP 404"
+
 # ---------------------------------------------------------------- one entry per path
 
 # A file deleted from the index but still on disk shows up in git as BOTH a
@@ -1393,7 +1449,7 @@ json_check "security v3: a review count of 0 is kept, a count of true is not" "$
 json_check "security v3: check events leave the run running" "$SEC_V3" \
   'data["running"] is True and data["run_id"] == "checks-run"'
 json_check "security v3: without a toolkit the runner is unavailable and idle" "$SEC_V3" \
-  'data["runner"] == {"available": False, "unavailable_reason": "No security toolkit is configured: start BranchLens with --toolkit PATH (a folder holding preflight.sh).", "active": False, "branch": None, "started_utc": None, "exit_code": None, "run_id": None, "log_tail": None}'
+  'data["runner"] == {"available": False, "unavailable_reason": "No security toolkit is configured: start BranchLens with --toolkit PATH (a folder holding preflight.sh).", "active": False, "branch": None, "base": None, "started_utc": None, "exit_code": None, "run_id": None, "log_tail": None}'
 json_check "security v3: a run with no report folder allows no push" "$SEC_V3" \
   'data["push"] == {"allowed": False, "reason": "The latest security check has no verdict yet.", "branch": None, "remote": None, "commit": None, "pushed": None, "output": None}'
 json_check "security v3: with no verdict.json and no run started here, what was judged is unknown" "$SEC_V3" \
@@ -3432,6 +3488,16 @@ expect_get "$S256_PORT" "$S256_BODY" "/api/diff?commit=$S256_SHA" "200" "sha256:
 expect_get "$S256_PORT" "$S256_BODY" "/api/file?commit=$S256_SHA&path=a.py" "200" "sha256: /api/file?commit= accepts a 64-character id"
 expect_get "$S256_PORT" "$S256_BODY" "/api/network?commit=$S256_SHA" "200" "sha256: /api/network?commit= accepts a 64-character id"
 expect_get "$S256_PORT" "$S256_BODY" "/api/diff?commit=$(printf 'a%.0s' $(seq 1 63))" "404" "sha256: an id of the wrong length is still refused"
+# The empty tree has a SHA-256 id of its own.
+expect_get "$S256_PORT" "$S256_BODY" "/api/diff?commit=$S256_SHA&base=empty-tree" "200" "sha256: /api/diff?commit= with base=empty-tree returns HTTP 200"
+json_check "sha256: compared with nothing, the commit's file is added" "$S256_BODY" \
+  '[(f["path"], f["status"], f["adds"]) for f in data["files"]] == [("a.py", "A", 1)] and data["base_empty_tree"] is True'
+expect_get "$S256_PORT" "$S256_BODY" "/api/diff?branch=main&base=empty-tree" "200" "sha256: /api/diff?branch= with base=empty-tree returns HTTP 200"
+json_check "sha256: compared with nothing, the branch's file is added" "$S256_BODY" \
+  '[(f["path"], f["status"], f["adds"]) for f in data["files"]] == [("a.py", "A", 1)] and data["mode"] == "worktree"'
+expect_get "$S256_PORT" "$S256_BODY" "/api/file?commit=$S256_SHA&path=a.py&base=empty-tree" "200" "sha256: /api/file?commit= with base=empty-tree returns HTTP 200"
+json_check "sha256: the file's patch starts from nothing" "$S256_BODY" \
+  '"--- /dev/null" in data["patch"] and "+import os" in data["patch"]'
 
 # ---------------------------------------------------------------- external diff and textconv
 # diff.<driver>.command and .textconv are programs git runs while diffing.
@@ -6284,7 +6350,7 @@ check "page: every server start makes a new token" $?
 
 http_get "$RUN_PORT" "$RUN_SEC" "/api/security" > /dev/null
 json_check "run: before any run there are no steps and the runner is idle" "$RUN_SEC" \
-  'data["enabled"] is True and data["checks"] == [] and data["runner"] == {"available": True, "unavailable_reason": None, "active": False, "branch": None, "started_utc": None, "exit_code": None, "run_id": None, "log_tail": None}'
+  'data["enabled"] is True and data["checks"] == [] and data["runner"] == {"available": True, "unavailable_reason": None, "active": False, "branch": None, "base": None, "started_utc": None, "exit_code": None, "run_id": None, "log_tail": None}'
 json_check "run: before any run no push is allowed" "$RUN_SEC" \
   'data["push"]["allowed"] is False and data["push"]["reason"] == "No security check has run yet." and data["push"]["pushed"] is None'
 json_check "run: before any run nothing has been judged" "$RUN_SEC" \
@@ -6442,6 +6508,16 @@ expect_post_error "run: a branch with no commits its base lacks" 400 \
 expect_post_error "run: a branch already contained in the given base" 400 \
   "main has no commits that feature lacks, so there is nothing to check: the check judges commits, not uncommitted edits." \
   /api/run "$RUN_TOKEN" "application/json" '{"branch": "main", "base": "feature"}'
+# A commit id is named by its short form.
+RUN_MAIN_TIP=$(git -C "$RUN_REPO" rev-parse refs/heads/main)
+expect_post_error "run: a commit id base the branch already contains is named by its short id" 400 \
+  "main has no commits that ${RUN_MAIN_TIP:0:7} lacks, so there is nothing to check: the check judges commits, not uncommitted edits." \
+  /api/run "$RUN_TOKEN" "application/json" '{"branch": "main", "base": "'"$RUN_MAIN_TIP"'"}'
+# A commit with no history in common: the toolkit would find no merge base.
+RUN_UNRELATED=$(git -C "$RUN_REPO" commit-tree "$(git -C "$RUN_REPO" rev-parse 'HEAD^{tree}')" -m "Unrelated history")
+expect_post_error "run: a base with no history in common with the branch" 400 \
+  "${RUN_UNRELATED:0:7} shares no history with feature, so there is no range of commits to check." \
+  /api/run "$RUN_TOKEN" "application/json" '{"branch": "feature", "base": "'"$RUN_UNRELATED"'"}'
 [ ! -e "$TOOLKIT/last-call.json" ]
 check "run: none of the refused runs reached the toolkit" $?
 
@@ -6459,7 +6535,7 @@ http_get "$RUN_PORT" "$RUN_SEC" "/api/security" > /dev/null
 json_check "run: the runner reports the branch, start time and exit code 0" "$RUN_SEC" \
   'data["runner"]["available"] is True and data["runner"]["active"] is False and data["runner"]["branch"] == "feature" and data["runner"]["exit_code"] == 0 and len(data["runner"]["started_utc"]) == 20 and data["runner"]["started_utc"].endswith("Z")'
 json_check "run: log_tail holds the end of the run's output" "$RUN_SEC" \
-  'data["runner"]["log_tail"].startswith("preflight check - repository: ") and data["runner"]["log_tail"].endswith("PIPELINE: READY TO PUBLISH")'
+  'data["runner"]["log_tail"].startswith("BranchLens runs: ") and "\npreflight check - repository: " in data["runner"]["log_tail"] and data["runner"]["log_tail"].endswith("PIPELINE: READY TO PUBLISH")'
 json_check "run: the runner names its run by the report folder its log gives" "$RUN_SEC" \
   'data["runner"]["run_id"] is not None and data["runner"]["run_id"] == data["run_id"]'
 json_check "run: a verdict.json with no areas list leaves the feed's areas and adds nothing" "$RUN_SEC" \
@@ -7308,6 +7384,71 @@ FP_UPSTREAM_MAIN=$(git -C "$FP_REPO" rev-parse refs/remotes/upstream/main)
 json_check "push remote: preflight.sh got the upstream/main base" "$FP_TOOLKIT/last-call.json" \
   'data["args"][2:] == [extra]' "$FP_UPSTREAM_MAIN"
 
+# ---- compare from the beginning: a run on the whole history ---------------------------------------
+# main is where origin/main is, so its default base leaves nothing to check
+# (see the refusals above). The page's "compare from the beginning" sends
+# the empty tree: the toolkit gets the word empty-tree, its feed and the run
+# log repeat it, and Push has nothing to send.
+
+rm -f "$TOOLKIT/knobs"
+run_check_and_wait '{"branch": "main", "base": "empty-tree"}'
+check "whole history: a run on main compared with nothing starts and finishes" $?
+json_check "whole history: the answer names the empty tree" "$POST_BODY" \
+  'data == {"started": True, "branch": "main", "base": "empty-tree"}'
+json_check "whole history: preflight.sh got run, the folder main is checked out in, and empty-tree" "$TOOLKIT/last-call.json" \
+  'data["args"][0] == "run" and os.path.realpath(data["args"][1]) == os.path.realpath(extra) and data["args"][2:] == ["empty-tree"]' "$RUN_REPO"
+RUN_LOG_FILE="$RUN_REPORTS/branchlens-run-$RUN_SERVER_PID.log"
+head -n 1 "$RUN_LOG_FILE" | grep -q '^BranchLens runs: .*/preflight\.sh run .* empty-tree$'
+check "whole history: the run log's first line is the preflight.sh command, ending in empty-tree" $?
+grep -qx "base ref: empty-tree" "$RUN_LOG_FILE"
+check "whole history: the toolkit's own log line names the empty-tree base" $?
+python3 - "$RUN_FEED" <<'PY'
+import json
+import sys
+
+starts = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    try:
+        event = json.loads(line)
+    except ValueError:
+        continue
+    if event.get("event") == "start":
+        starts.append(event)
+sys.exit(0 if starts and starts[-1].get("base") == "empty-tree" else 1)
+PY
+check "whole history: the feed's start event records the base empty-tree" $?
+http_get "$RUN_PORT" "$RUN_SEC" "/api/security" > /dev/null
+json_check "whole history: /api/security and its runner name the empty-tree base" "$RUN_SEC" \
+  'data["base"] == "empty-tree" and data["runner"]["base"] == "empty-tree" and data["runner"]["branch"] == "main" and data["verdict_word"] == "READY TO PUBLISH"'
+RUN_WHOLE_ID=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["run_id"])' "$RUN_SEC")
+json_check "whole history: the run's review-scope.json starts at the empty tree" "$RUN_REPORTS/$RUN_WHOLE_ID/review-scope.json" \
+  'data["fork_commit"] == extra and data["base_ref"] == "empty-tree"' "$(git -C "$RUN_REPO" hash-object -t tree /dev/null)"
+json_check "whole history: Push has nothing to send, main is already on origin" "$RUN_SEC" \
+  'data["push"]["allowed"] is False and data["push"]["reason"] == "Already pushed: origin/main is at " + extra[:7] + "."' "$RUN_MAIN_TIP"
+# The diff view of the same main: nothing pending against origin/main, and
+# every file it holds compared with nothing.
+RUN_DIFF="$FIXTURE/run-diff.json"
+expect_get "$RUN_PORT" "$RUN_DIFF" "/api/diff?branch=main" "200" "whole history: /api/diff on main returns HTTP 200"
+json_check "whole history: main equal to origin/main has nothing pending" "$RUN_DIFF" \
+  'data["mode"] == "default-branch" and data["files"] == []'
+expect_get "$RUN_PORT" "$RUN_DIFF" "/api/diff?branch=main&base=empty-tree" "200" "whole history: /api/diff on main from the empty tree returns HTTP 200"
+json_check "whole history: compared with nothing, main lists every file it holds as added" "$RUN_DIFF" \
+  'data["mode"] == "worktree" and data["base_empty_tree"] is True and [(f["path"], f["status"]) for f in data["files"] if not f["untracked"]] == [("app.py", "A")]'
+
+# A commit picked with "compare from here" reaches the toolkit as its id,
+# and the answers name it by that id: the page shows its short form.
+run_check_and_wait '{"branch": "feature", "base": "'"$RUN_MAIN_TIP"'"}'
+check "picked base: a run on feature from a picked commit starts and finishes" $?
+json_check "picked base: the answer names the picked commit" "$POST_BODY" \
+  'data == {"started": True, "branch": "feature", "base": extra}' "$RUN_MAIN_TIP"
+json_check "picked base: preflight.sh got the picked commit's id" "$TOOLKIT/last-call.json" \
+  'data["args"][2:] == [extra]' "$RUN_MAIN_TIP"
+head -n 1 "$RUN_LOG_FILE" | grep -q " $RUN_MAIN_TIP\$"
+check "picked base: the run log's first line ends in the picked commit's id" $?
+http_get "$RUN_PORT" "$RUN_SEC" "/api/security" > /dev/null
+json_check "picked base: /api/security and its runner name the picked commit" "$RUN_SEC" \
+  'data["base"] == extra and data["runner"]["base"] == extra' "$RUN_MAIN_TIP"
+
 # ---- stopping the server stops its run ----------------------------------------------------------
 
 printf 'FAKE_SLEEP=30\n' > "$TOOLKIT/knobs"
@@ -7490,7 +7631,7 @@ git -C "$GATE_WT" commit -q -am "Gated: second step"
 GATE_TIP2=$(git -C "$GATE_WT" rev-parse HEAD)
 gate_run '{"branch": "gated", "base": "'"$GATE_LANDED"'"}'
 check "unjudged history: a run that judges only the newest commit finishes" $?
-UNJUDGED_REASON="The check judged only ${GATE_LANDED:0:7}..${GATE_TIP2:0:7}; the push would also send 1 older commit it never judged: run the check against the remote's copy or from the empty tree."
+UNJUDGED_REASON="The check judged only ${GATE_LANDED:0:7}..${GATE_TIP2:0:7}; the push would also send 1 older commit it never judged: run the check again with no commit picked as its base, or compare from the beginning."
 http_get "$GATE_PORT" "$GATE_SEC" "/api/security" > /dev/null
 json_check "unjudged history: READY on a narrow range leaves Push off, naming the range and the rest" "$GATE_SEC" \
   'data["verdict_word"] == "READY TO PUBLISH" and data["push"]["allowed"] is False and data["push"]["reason"] == extra' "$UNJUDGED_REASON"
@@ -7555,11 +7696,52 @@ printf '{"fork_commit": "%s", "head_commit": "%s"}\n' "$GATE_MAIN" "$GATE_TIP" \
 http_get "$GATE_PORT" "$GATE_SEC" "/api/security" > /dev/null
 json_check "unjudged history: a review-scope.json about another commit is not used" "$GATE_SEC" \
   'data["push"]["allowed"] is False and data["push"]["reason"] == extra' "$UNJUDGED_REASON"
+# A base_ref that is a commit id gives the fork itself: merge-base(base_ref,
+# commit). A review-scope.json that names another fork contradicts it, and
+# a wider one must not unlock Push.
+FORK_DISAGREES_REASON="The latest check's records disagree about where the history it judged starts (review-scope.json and base_ref): run the check again."
+GATE_EMPTY_TREE=$(git -C "$GATE_REPO" hash-object -t tree /dev/null)
 printf '{"fork_commit": "%s", "head_commit": "%s"}\n' "$GATE_MAIN" "$GATE_TIP2" \
   > "$GATE_REPORTS/narrow-run/review-scope.json"
 http_get "$GATE_PORT" "$GATE_SEC" "/api/security" > /dev/null
-json_check "unjudged history: review-scope.json's fork_commit comes before base_ref" "$GATE_SEC" \
+json_check "unjudged history: a wider fork_commit than a commit-id base_ref gives keeps Push off" "$GATE_SEC" \
+  'data["push"]["allowed"] is False and data["push"]["reason"] == extra' "$FORK_DISAGREES_REASON"
+printf '{"fork_commit": "%s", "head_commit": "%s"}\n' "$GATE_EMPTY_TREE" "$GATE_TIP2" \
+  > "$GATE_REPORTS/narrow-run/review-scope.json"
+http_get "$GATE_PORT" "$GATE_SEC" "/api/security" > /dev/null
+json_check "unjudged history: an empty-tree fork_commit under a commit-id base_ref keeps Push off" "$GATE_SEC" \
+  'data["push"]["allowed"] is False and data["push"]["reason"] == extra' "$FORK_DISAGREES_REASON"
+printf '{"fork_commit": "%s"}\n' "$GATE_MAIN" > "$GATE_REPORTS/narrow-run/review-scope.json"
+http_get "$GATE_PORT" "$GATE_SEC" "/api/security" > /dev/null
+json_check "unjudged history: a review-scope.json without head_commit is not used" "$GATE_SEC" \
+  'data["push"]["allowed"] is False and data["push"]["reason"] == extra' "$UNJUDGED_REASON"
+# A base_ref that is a name (a terminal run's default) may point elsewhere
+# by now: the fork the scope recorded when the run started comes first,
+# here a narrower one than origin/main gives now.
+gate_terminal_run "named-run" "$GATE_CHECK_FIELDS" "" "READY TO PUBLISH"
+json_check "unjudged history: base_ref origin/main alone allows the push" "$GATE_SEC" \
   'data["push"]["allowed"] is True'
+printf '{"fork_commit": "%s", "head_commit": "%s"}\n' "$GATE_LANDED" "$GATE_TIP2" \
+  > "$GATE_REPORTS/named-run/review-scope.json"
+http_get "$GATE_PORT" "$GATE_SEC" "/api/security" > /dev/null
+json_check "unjudged history: under a named base_ref, review-scope.json's fork_commit comes first" "$GATE_SEC" \
+  'data["push"]["allowed"] is False and data["push"]["reason"] == extra' "$UNJUDGED_REASON"
+printf '{"fork_commit": "%s", "head_commit": "%s"}\n' "$GATE_EMPTY_TREE" "$GATE_TIP2" \
+  > "$GATE_REPORTS/named-run/review-scope.json"
+http_get "$GATE_PORT" "$GATE_SEC" "/api/security" > /dev/null
+json_check "unjudged history: a named base_ref never gives the empty tree, so that fork_commit keeps Push off" "$GATE_SEC" \
+  'data["push"]["allowed"] is False and data["push"]["reason"] == extra' "$FORK_DISAGREES_REASON"
+gate_terminal_run "whole-history-run" '"mode": "check", "base_ref": "empty-tree", ' "" "READY TO PUBLISH"
+printf '{"fork_commit": "%s", "head_commit": "%s"}\n' "$GATE_EMPTY_TREE" "$GATE_TIP2" \
+  > "$GATE_REPORTS/whole-history-run/review-scope.json"
+http_get "$GATE_PORT" "$GATE_SEC" "/api/security" > /dev/null
+json_check "unjudged history: base_ref empty-tree with the empty tree as its fork_commit allows the push" "$GATE_SEC" \
+  'data["push"]["allowed"] is True'
+printf '{"fork_commit": "%s", "head_commit": "%s"}\n' "$GATE_LANDED" "$GATE_TIP2" \
+  > "$GATE_REPORTS/whole-history-run/review-scope.json"
+http_get "$GATE_PORT" "$GATE_SEC" "/api/security" > /dev/null
+json_check "unjudged history: base_ref empty-tree with a commit as its fork_commit keeps Push off" "$GATE_SEC" \
+  'data["push"]["allowed"] is False and data["push"]["reason"] == extra' "$FORK_DISAGREES_REASON"
 
 # Only mode "check" judged a commit (g148).
 gate_terminal_run "mode-unknown-run" '"mode": "?", "base_ref": "origin/main", ' "" "READY TO PUBLISH"
@@ -7947,6 +8129,245 @@ sys.exit(0)
 PY
 check "blocked host: %-escapes, IPv6 literals and an ssh alias's HostName are all checked" $?
 
+# ---- Push after a run from a picked base: narrow, or the whole history -------------
+# The page sends the base it shows: a commit picked with "compare from here",
+# or the empty tree ("compare from the beginning"). A run judges
+# merge-base(base, tip)..tip. Push may send only commits a READY run judged,
+# so a narrow base unlocks it only when the remote already has every commit
+# before that range; the empty tree judged the whole history. topic has
+# PICK_C1 on the remote, then PICK_C2 and PICK_C3 here only.
+
+PICK_ORIGIN="$FIXTURE/pick-origin.git"
+PICK_OTHER="$FIXTURE/pick-other.git"
+PICK_REPO="$FIXTURE/pickrepo"
+PICK_WT="$FIXTURE/pickrepo-topic"
+PICK_REPORTS="$FIXTURE/pick-reports"
+PICK_FEED="$PICK_REPORTS/security-feed.jsonl"
+PICK_TOOLKIT="$FIXTURE/pick-toolkit"
+PICK_SEC="$FIXTURE/pick-security.json"
+PICK_POST="$FIXTURE/pick-post.json"
+
+set_commit_date "2026-04-01T10:00:00 +0000"
+git init -q --bare -b main "$PICK_ORIGIN"
+git init -q --bare -b main "$PICK_OTHER"
+new_repo "$PICK_REPO"
+printf 'print("pick")\n' > "$PICK_REPO/app.py"
+git -C "$PICK_REPO" add -A
+git -C "$PICK_REPO" commit -q -m "Pick fixture: first commit"
+git -C "$PICK_REPO" remote add origin "$PICK_ORIGIN"
+git -C "$PICK_REPO" push -q origin main
+git -C "$PICK_REPO" worktree add -q -b topic "$PICK_WT"
+set_commit_date "2026-04-01T10:01:00 +0000"
+printf 'one\n' > "$PICK_WT/topic.txt"
+git -C "$PICK_WT" add -A
+git -C "$PICK_WT" commit -q -m "Topic: first step"
+PICK_C1=$(git -C "$PICK_WT" rev-parse HEAD)
+git -C "$PICK_WT" push -q origin "$PICK_C1:refs/heads/topic"
+set_commit_date "2026-04-01T10:02:00 +0000"
+printf 'one\ntwo\n' > "$PICK_WT/topic.txt"
+git -C "$PICK_WT" commit -q -am "Topic: second step"
+PICK_C2=$(git -C "$PICK_WT" rev-parse HEAD)
+set_commit_date "2026-04-01T10:03:00 +0000"
+printf 'one\ntwo\nthree\n' > "$PICK_WT/topic.txt"
+git -C "$PICK_WT" commit -q -am "Topic: third step"
+PICK_C3=$(git -C "$PICK_WT" rev-parse HEAD)
+[ "$(git -C "$PICK_REPO" rev-parse -q --verify refs/remotes/origin/topic)" = "$PICK_C1" ] && \
+  ! git --git-dir="$PICK_ORIGIN" cat-file -e "$PICK_C2" 2>/dev/null
+check "picked base push: in the fixture the remote has the first step of topic and not the second" $?
+
+mkdir -p "$PICK_TOOLKIT"
+cp "$TOOLKIT/preflight.sh" "$PICK_TOOLKIT/preflight.sh"
+PICK_LOG="$FIXTURE/server-pick.log"
+python3 -m branchlens "$PICK_REPO" --port 0 --no-browser \
+  --toolkit "$PICK_TOOLKIT" --security-feed "$PICK_FEED" \
+  --no-push-host work.example > "$PICK_LOG" 2>&1 &
+echo "$!" >> "$FIXTURE/extra-pids"
+PICK_PORT=$(wait_for_server "$PICK_LOG")
+check "picked base push: server starts with a toolkit and a blocked push host" $?
+PICK_TOKEN=$(page_token "$PICK_PORT")
+
+# Start a check on the pick server, wait for it to end and read /api/security.
+# $1: the JSON body.
+pick_run() {
+  local status
+  status=$(http_post "$PICK_PORT" "$PICK_POST" "/api/run" "$PICK_TOKEN" "application/json" "$1")
+  [ "$status" = "200" ] && wait_for_security "$PICK_PORT" 'data["runner"]["active"] is False' && \
+    http_get "$PICK_PORT" "$PICK_SEC" "/api/security" > /dev/null
+}
+PICK_UNJUDGED_REASON="The check judged only ${PICK_C2:0:7}..${PICK_C3:0:7}; the push would also send 1 older commit it never judged: run the check again with no commit picked as its base, or compare from the beginning."
+
+# A narrow base: the second step, which the remote lacks.
+pick_run '{"branch": "topic", "base": "'"$PICK_C2"'"}'
+check "picked base push: a run from the second step starts and finishes" $?
+json_check "picked base push: READY from a commit the remote lacks leaves Push off, naming the commit it never judged" "$PICK_SEC" \
+  'data["verdict_word"] == "READY TO PUBLISH" and data["base"] == "'"$PICK_C2"'" and data["push"]["allowed"] is False and data["push"]["reason"] == extra' "$PICK_UNJUDGED_REASON"
+STATUS=$(http_post "$PICK_PORT" "$PICK_POST" "/api/push" "$PICK_TOKEN" "application/json" '{"branch": "topic"}')
+expect_status "409" "picked base push: POST /api/push after the narrow run is refused with HTTP 409"
+[ "$(git --git-dir="$PICK_ORIGIN" rev-parse -q --verify refs/heads/topic)" = "$PICK_C1" ] && \
+  ! git --git-dir="$PICK_ORIGIN" cat-file -e "$PICK_C2" 2>/dev/null
+check "picked base push: the remote got nothing from the narrow run" $?
+
+# A narrow base the remote already has: everything after it was judged.
+pick_run '{"branch": "topic", "base": "'"$PICK_C1"'"}'
+check "picked base push: a run from the first step starts and finishes" $?
+json_check "picked base push: READY from a commit the remote has allows Push of the tip" "$PICK_SEC" \
+  'data["push"]["allowed"] is True and data["push"]["commit"] == extra' "$PICK_C3"
+
+# The whole history: allowed though the remote lacks the second step, except
+# where --no-push-host forbids the host.
+git -C "$PICK_REPO" config remote.origin.pushurl https://code.work.example/team/pick.git
+pick_run '{"branch": "topic", "base": "empty-tree"}'
+check "picked base push: a run on the whole history starts and finishes" $?
+json_check "picked base push: --no-push-host still keeps Push off after a whole-history READY" "$PICK_SEC" \
+  'data["verdict_word"] == "READY TO PUBLISH" and data["base"] == "empty-tree" and data["push"]["allowed"] is False and data["push"]["reason"] == "Repositories on code.work.example are pushed from another machine: port the change by hand."'
+STATUS=$(http_post "$PICK_PORT" "$PICK_POST" "/api/push" "$PICK_TOKEN" "application/json" '{"branch": "topic"}')
+expect_status "409" "picked base push: POST /api/push to a blocked host is refused with HTTP 409"
+# A whole-history run needs no knowledge of what the push address has.
+git -C "$PICK_REPO" config remote.origin.pushurl "$PICK_OTHER"
+http_get "$PICK_PORT" "$PICK_SEC" "/api/security" > /dev/null
+json_check "picked base push: after a whole-history READY, a pushurl elsewhere is no reason to refuse" "$PICK_SEC" \
+  'data["push"]["allowed"] is True'
+git -C "$PICK_REPO" config --unset remote.origin.pushurl
+http_get "$PICK_PORT" "$PICK_SEC" "/api/security" > /dev/null
+json_check "picked base push: after a whole-history READY, Push is allowed though the remote lacks older commits" "$PICK_SEC" \
+  'data["push"]["allowed"] is True and data["push"]["commit"] == extra' "$PICK_C3"
+STATUS=$(http_post "$PICK_PORT" "$PICK_POST" "/api/push" "$PICK_TOKEN" "application/json" '{"branch": "topic"}')
+expect_status "200" "picked base push: POST /api/push after the whole-history run answers HTTP 200"
+json_check "picked base push: the push went through" "$PICK_POST" 'data["pushed"] is True'
+[ "$(git --git-dir="$PICK_ORIGIN" rev-parse -q --verify refs/heads/topic)" = "$PICK_C3" ] && \
+  git --git-dir="$PICK_ORIGIN" cat-file -e "$PICK_C2" 2>/dev/null
+check "picked base push: the remote now has the tip and the second step" $?
+[ -z "$(git --git-dir="$PICK_OTHER" for-each-ref)" ]
+check "picked base push: the other address got nothing" $?
+
+# The base a run was started with is the one its records must name: a
+# verdict.json rewritten to the empty tree after a narrow run started here
+# does not unlock Push (agents of the review can write in the run folder).
+set_commit_date "2026-04-01T10:04:00 +0000"
+printf 'one\ntwo\nthree\nfour\n' > "$PICK_WT/topic.txt"
+git -C "$PICK_WT" commit -q -am "Topic: fourth step"
+PICK_C4=$(git -C "$PICK_WT" rev-parse HEAD)
+set_commit_date "2026-04-01T10:05:00 +0000"
+printf 'one\ntwo\nthree\nfour\nfive\n' > "$PICK_WT/topic.txt"
+git -C "$PICK_WT" commit -q -am "Topic: fifth step"
+PICK_C5=$(git -C "$PICK_WT" rev-parse HEAD)
+pick_run '{"branch": "topic", "base": "'"$PICK_C4"'"}'
+check "picked base push: a run from the fourth step starts and finishes" $?
+json_check "picked base push: that narrow run leaves Push off" "$PICK_SEC" \
+  'data["push"]["allowed"] is False and " the push would also send 1 older commit " in data["push"]["reason"]'
+PICK_RUN_ID=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["run_id"])' "$PICK_SEC")
+python3 - "$PICK_REPORTS/$PICK_RUN_ID" "$(git -C "$PICK_REPO" hash-object -t tree /dev/null)" <<'PY'
+import json
+import os
+import sys
+
+folder, empty_tree = sys.argv[1], sys.argv[2]
+for name, field, value in (("verdict.json", "base_ref", "empty-tree"),
+                           ("review-scope.json", "base_ref", "empty-tree"),
+                           ("review-scope.json", "fork_commit", empty_tree)):
+    path = os.path.join(folder, name)
+    record = json.load(open(path))
+    record[field] = value
+    json.dump(record, open(path, "w"))
+PY
+http_get "$PICK_PORT" "$PICK_SEC" "/api/security" > /dev/null
+json_check "picked base push: a run folder rewritten to the whole history after a narrow run started here keeps Push off" "$PICK_SEC" \
+  'data["push"]["allowed"] is False and data["push"]["reason"] == "The latest check records another base than the one BranchLens started it with: run the check again."'
+
+# A replace ref can graft history a remote has on top of a local commit; the
+# count of commits a push would send ignores it, as the push itself does.
+set_commit_date "2026-04-01T10:06:00 +0000"
+git -C "$PICK_REPO" checkout -q -b side main
+printf 'side\n' > "$PICK_REPO/side.txt"
+git -C "$PICK_REPO" add side.txt
+git -C "$PICK_REPO" commit -q -m "Side: on the remote"
+PICK_SIDE=$(git -C "$PICK_REPO" rev-parse HEAD)
+git -C "$PICK_REPO" push -q origin side
+git -C "$PICK_REPO" checkout -q main
+git -C "$PICK_REPO" replace --graft "$PICK_SIDE" "$(git -C "$PICK_REPO" rev-parse main)" "$PICK_C4"
+[ "$(git -C "$PICK_REPO" rev-list --count "$PICK_C4" --not --remotes=origin --)" = "0" ]
+check "picked base push: in the fixture the graft makes plain git count no commit the remote lacks" $?
+python3 - "$PICK_REPO" "$PICK_C4" <<'PY'
+import sys
+
+from branchlens import gitops
+
+sys.exit(0 if gitops.count_commits_missing_on_remote(sys.argv[1], sys.argv[2], "origin") == 1 else 1)
+PY
+check "picked base push: the count ignores the graft and finds the commit the remote lacks" $?
+pick_run '{"branch": "topic", "base": "'"$PICK_C4"'"}'
+check "picked base push: under the graft, a run from the fourth step starts and finishes" $?
+json_check "picked base push: under the graft, that narrow run still leaves Push off" "$PICK_SEC" \
+  'data["verdict_word"] == "READY TO PUBLISH" and data["push"]["allowed"] is False and " the push would also send 1 older commit " in data["push"]["reason"]'
+git -C "$PICK_REPO" replace -d "$PICK_SIDE" > /dev/null
+
+# The same decisions, read straight from publish: judged_fork_commit gives
+# the start of the judged history, and check_push decides on it.
+python3 - "$PICK_REPO" "$PICK_REPORTS" "$PICK_C4" "$PICK_C5" <<'PY'
+import json
+import os
+import sys
+
+from branchlens import gitops
+from branchlens import publish
+
+repo, reports, base_commit, tip = sys.argv[1:5]
+empty_tree = gitops.empty_tree_id(tip)
+problems = []
+
+
+def run_folder(name, base_ref, fork_commit):
+    folder = os.path.join(reports, name)
+    os.makedirs(folder, exist_ok=True)
+    verdict = {"verdict": "READY TO PUBLISH", "exit_code": 0, "review_merged": True,
+               "review_confirmed": True, "mode": "check", "base_ref": base_ref,
+               "repository": {"path": repo, "branch": "topic", "commit": tip}}
+    json.dump(verdict, open(os.path.join(folder, "verdict.json"), "w"))
+    scope = {"base_ref": base_ref, "fork_commit": fork_commit, "head_commit": tip}
+    json.dump(scope, open(os.path.join(folder, "review-scope.json"), "w"))
+    return folder, verdict
+
+
+def decide(name, started_base):
+    return publish.check_push(
+        repo, reports, run_id=name, feed_running=False,
+        feed_verdict_word="READY TO PUBLISH", cancelled_run_id=None,
+        run_active=False, active_branch=None, active_commit=None,
+        blocked_host_suffixes=["work.example"], feed_findings=[],
+        started_base=started_base)
+
+
+folder, verdict = run_folder("unit-narrow", base_commit, base_commit)
+if publish.judged_fork_commit(repo, folder, verdict, tip) != (base_commit, None):
+    problems.append("narrow: the fork is the picked commit")
+status = decide("unit-narrow", base_commit)
+if status["allowed"] or " the push would also send 1 older commit " not in status["reason"]:
+    problems.append("narrow: Push stays off: " + status["reason"])
+
+folder, verdict = run_folder("unit-whole", "empty-tree", empty_tree)
+if publish.judged_fork_commit(repo, folder, verdict, tip) != (empty_tree, None):
+    problems.append("whole: the fork is the empty tree")
+status = decide("unit-whole", "empty-tree")
+if not status["allowed"] or status["commit"] != tip:
+    problems.append("whole: Push is allowed: " + status["reason"])
+
+status = decide("unit-whole", base_commit)
+if status["allowed"] or status["reason"] != publish.BASE_MISMATCH_REASON:
+    problems.append("whole: started from another base: " + status["reason"])
+
+folder, verdict = run_folder("unit-forged", base_commit, empty_tree)
+if publish.judged_fork_commit(repo, folder, verdict, tip) != (None, publish.FORK_DISAGREES_REASON):
+    problems.append("forged: an empty-tree fork under a commit base_ref is refused")
+status = decide("unit-forged", None)
+if status["allowed"] or status["reason"] != publish.FORK_DISAGREES_REASON:
+    problems.append("forged: Push stays off: " + status["reason"])
+
+for problem in problems:
+    print(problem)
+sys.exit(1 if problems else 0)
+PY
+check "picked base push: publish decides alike: narrow refused, whole history allowed, a different or forged base refused" $?
+
 # ---- the page's Content-Security-Policy and the common headers (g155) -------------
 
 GATE_PAGE="$FIXTURE/gate-page.html"
@@ -8241,8 +8662,9 @@ import sys
 from pagesource import text, function_body
 # The Run card, the banner and the verdict card all name the empty-tree base
 # through one helper, and the idle Run card reads first_publish.
-calls = ["appendRunBase(runCard.base, baseKey)", "appendRunBase(banner, feed.base)",
-         "appendRunBase(context, feed.base)"]
+calls = ["appendRunBase(runCard.base, baseKey, shownBranchName)",
+         "appendRunBase(banner, feed.base, branchName)",
+         "appendRunBase(context, feed.base, branchName)"]
 if any(call not in text for call in calls):
     sys.exit(1)
 if '"nothing (first publish)"' not in text or '": the whole history is checked"' not in text:
@@ -8267,6 +8689,70 @@ if body.index("currentState.first_publish === true") > body.index("currentState.
 sys.exit(0)
 PY
 check "push remote: the idle Run card names the default branch's push remote copy as its base" $?
+
+python3 - "$SOURCE_DIR/static/app.html" <<'PY'
+import sys
+
+from pagesource import text, function_body
+# Run sends the base the page shows: the one picked in the Tree, if any.
+run = function_body("startRun")
+if "body.base = baseSha;" not in run or \
+        run.index("body.base = baseSha;") > run.index('postJson("/api/run", body)'):
+    sys.exit(1)
+if "runBaseText(base, target.name)" not in run or "runBaseConsentLines(base, target)" not in run:
+    sys.exit(1)
+# The confirm and the cards word the empty tree alike.
+for words in ('"nothing (whole history)"', '"nothing (first publish)"'):
+    if words not in function_body("runBaseText") or words not in function_body("appendRunBase"):
+        sys.exit(1)
+# The idle Run card names the picked base; while a run starts, the base the
+# server started it with.
+card = function_body("updateRunCardWith")
+if "baseLabel = baseSha;" not in card or \
+        "runner.base !== null ? runner.base : defaultRunBase(shownBranch)" not in card:
+    sys.exit(1)
+if "base: nonEmptyString(runner.base)" not in function_body("runnerInfo"):
+    sys.exit(1)
+# Picking or dropping a base refreshes the Run card.
+if "updateRunCard();" not in function_body("setBaseCommit"):
+    sys.exit(1)
+sys.exit(0)
+PY
+check "picked base: Run sends the base picked in the Tree, and its confirm and the Run card name it" $?
+
+python3 - "$SOURCE_DIR/static/app.html" <<'PY'
+import sys
+
+from pagesource import text, function_body
+# The tree ends with "compare from the beginning": a button that makes the
+# empty tree the base, below the oldest commit and the truncation note.
+tree = function_body("renderTree")
+if "treeListElement.appendChild(makeTreeBeginningEntry(svgWidth));" not in tree:
+    sys.exit(1)
+if tree.index('"· showing the latest "') > tree.index("makeTreeBeginningEntry(svgWidth)"):
+    sys.exit(1)
+entry = function_body("makeTreeBeginningEntry")
+if 'makeText("button", "beginning-chip", "compare from the beginning")' not in entry or \
+        "setBaseCommit(EMPTY_TREE_BASE);" not in entry or 'button.type = "button";' not in entry:
+    sys.exit(1)
+# Unlike a commit's compare chip, it needs no hover to show.
+rule_start = text.index(".beginning-chip {")
+if "display: none" in text[rule_start:text.index("}", rule_start)]:
+    sys.exit(1)
+# The empty tree is in no graph: neither a graph refresh nor a reload drops it.
+if "baseSha !== EMPTY_TREE_BASE && !graphHasSha(baseSha)" not in function_body("afterGraphRefresh"):
+    sys.exit(1)
+if "saved.base === EMPTY_TREE_BASE" not in function_body("openStartingView"):
+    sys.exit(1)
+# A file gone from a whole-tree comparison is not described as a change since a commit.
+if "currentDiff.base_empty_tree === true" not in function_body("renderDiffBody"):
+    sys.exit(1)
+# Badges stay on when the shown run judged from the base picked in the Tree.
+if "if (baseSha !== null && !pickedBaseWasJudged(view)) {" not in function_body("selectionIsJudged"):
+    sys.exit(1)
+sys.exit(0)
+PY
+check "compare from the beginning: the tree's last entry picks the empty tree, which a graph refresh or a reload keeps" $?
 
 python3 - "$SOURCE_DIR/static/app.html" <<'PY'
 import sys
@@ -9189,7 +9675,8 @@ if not start < text.index("function shellWord(") < text.index("/* CHECK-EXTRACT-
     sys.exit(1)
 # Run asks first; Push already did
 run = function_body("startRun")
-if "window.confirm(question)" not in run or '"Run the security check on " + target.name + "?"' not in run:
+if "window.confirm(question)" not in run or \
+        '"Run the security check on " + target.name + ", " + comparedWith + "?"' not in run:
     sys.exit(1)
 if run.index("window.confirm(question)") > run.index('pendingAction = "run";'):
     sys.exit(1)

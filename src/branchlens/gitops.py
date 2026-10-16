@@ -410,17 +410,22 @@ def stop_running_git():
         git_child.kill_group()
 
 
-def run_git(args, cwd=None, allow_exit_code_1=False, timeout_key=None):
+def run_git(args, cwd=None, allow_exit_code_1=False, timeout_key=None,
+            without_replace_refs=False):
     """Run one whitelisted git command and return its stdout as raw bytes.
 
     check_git_result() decides which exit codes count as success; any other
     raises GitError with git's stderr included, and so does a git that ran
     past GIT_TIMEOUT_SECONDS. git never reads the server's stdin: 'diff
     --no-index' would read it for a file named '-'. timeout_key: see
-    _LAST_TIMEOUT_BY_KEY.
+    _LAST_TIMEOUT_BY_KEY. without_replace_refs: git ignores refs/replace,
+    so it walks the history a push sends and the security toolkit judges.
     """
+    environment = hardening_environment()
+    if without_replace_refs:
+        environment["GIT_NO_REPLACE_OBJECTS"] = "1"
     git_child = GitChild(
-        args, cwd, hardening_environment(), subprocess.PIPE, subprocess.PIPE,
+        args, cwd, environment, subprocess.PIPE, subprocess.PIPE,
         timeout_key=timeout_key,
     )
     try:
@@ -1041,11 +1046,14 @@ def count_commits_missing_on_remote(push_directory, commit, remote_name):
     first time, as far as the last fetch or push knows. commit must be a
     full commit id and remote_name must hold no glob character, since
     --remotes= takes a pattern. Raises GitError when git cannot count.
+    Replace refs are ignored, as by the push itself: a graft could hide a
+    commit the remote lacks.
     """
-    output = run_git_text(
+    output = run_git(
         ["rev-list", "--count", commit, "--not", "--remotes=" + remote_name, "--"],
         cwd=push_directory,
-    ).strip()
+        without_replace_refs=True,
+    ).decode("utf-8", errors="replace").strip()
     try:
         return int(output)
     except ValueError:
@@ -1146,6 +1154,10 @@ def read_push_facts(push_directory, branch, known_ref=None, known_commit=None):
 
 EMPTY_TREE_SHA1 = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 EMPTY_TREE_SHA256 = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+# The base= word for comparing with nothing: every file counts as added, and
+# a security run judges the whole history. The empty tree's id is not
+# accepted in its place: its form depends on the object format.
+EMPTY_TREE_BASE = "empty-tree"
 
 
 def empty_tree_id(sample_sha):
@@ -1156,6 +1168,21 @@ def empty_tree_id(sample_sha):
     if len(sample_sha) == 64:
         return EMPTY_TREE_SHA256
     return EMPTY_TREE_SHA1
+
+
+def find_judged_merge_base(push_directory, first_commit, second_commit):
+    """The merge base of two commits as the security toolkit finds it, or "" for unrelated histories.
+
+    Unlike find_merge_base it ignores replace refs, as the toolkit does, and
+    keeps no cache. Both arguments are full commit ids. The run's start
+    check and the Push gating use it.
+    """
+    return run_git(
+        ["merge-base", first_commit, second_commit],
+        cwd=push_directory,
+        allow_exit_code_1=True,
+        without_replace_refs=True,
+    ).decode("utf-8", errors="replace").strip()
 
 
 def _worktree_belongs_to_repo(worktree_path, common_dir):
@@ -1621,7 +1648,9 @@ def build_diff_context(repo_root, branch, base_record=None):
 
     base_record, when given, is a commit dict from the graph listing that
     the user picked as the comparison point; it replaces the merge-base.
-    The sentence describing the result comes from diff_explanation().
+    It can also be resolve_base_record's empty-tree record: the branch is
+    then compared with nothing. The sentence describing the result comes
+    from diff_explanation().
     """
     for_each_ref_raw, branch_records = read_branch_records(repo_root)
     branch_names = []
@@ -1654,6 +1683,8 @@ def build_diff_context(repo_root, branch, base_record=None):
         "comparison_label": comparison_label,
         "worktree_path": worktree_path,
         "base_override": False,
+        # True when the picked base is the empty tree ("compare from the beginning").
+        "base_empty_tree": False,
         "base_subject": None,
         "base_is_ancestor": None,
         "base_is_descendant": None,
@@ -1662,6 +1693,22 @@ def build_diff_context(repo_root, branch, base_record=None):
         # The existing push remote that has no copy of the default branch.
         "first_publish_remote": None,
     }
+
+    if base_record is not None and base_record["empty_tree"]:
+        # Compared with nothing: every file on the branch is added. This must
+        # come before the default branch's modes, which diff against HEAD.
+        # git answers no ancestry question about a tree: they are set here.
+        context["merge_base"] = empty_tree_id(branch_sha)
+        context["base_commit"] = None
+        context["base_override"] = True
+        context["base_empty_tree"] = True
+        context["base_is_ancestor"] = True
+        context["base_is_descendant"] = False
+        if worktree_path is not None:
+            context["mode"] = "worktree"
+        else:
+            context["mode"] = "committed"
+        return context
 
     if base_record is not None:
         # Comparing with a user-picked point: no merge-base is involved, and
@@ -1781,6 +1828,8 @@ def diff_explanation(context, has_uncommitted):
     else:
         ending = "."
 
+    if context["base_empty_tree"]:
+        return f"Everything on {branch}, compared with nothing (its whole history)" + ending
     if context["base_override"]:
         base_subject = context["base_subject"]
         if context["base_is_ancestor"]:
@@ -2203,15 +2252,30 @@ def read_changed_files(context, with_counts=True):
 
 
 def resolve_base_record(repo_root, base_sha):
-    """Validate an optional base= value against the fresh graph listing."""
+    """Validate an optional base= value against the fresh graph listing.
+
+    Returns None without a base, else a dict with sha, subject and
+    empty_tree. The word "empty-tree" needs no listing: its record has
+    empty_tree True and no sha or subject (the id depends on the branch's
+    object format, read later).
+    """
     if base_sha is None:
         return None
+    if base_sha == EMPTY_TREE_BASE:
+        return {"sha": None, "subject": None, "empty_tree": True}
     graph_commits = read_graph_commits(repo_root)
-    return resolve_graph_commit(base_sha, graph_commits)
+    record = dict(resolve_graph_commit(base_sha, graph_commits))
+    record["empty_tree"] = False
+    return record
 
 
 def get_diff(repo_root, branch, base_sha=None):
-    """Changed-file overview for /api/diff."""
+    """Changed-file overview for /api/diff.
+
+    base_sha: a commit id from the graph listing ("compare from here"), or
+    "empty-tree" ("compare from the beginning"): every file of the branch is
+    then added, and the answer carries base_empty_tree: true.
+    """
     base_record = resolve_base_record(repo_root, base_sha)
     context = build_diff_context(repo_root, branch, base_record)
     reads_status = (
@@ -2254,6 +2318,8 @@ def get_diff(repo_root, branch, base_sha=None):
         response["base_subject"] = context["base_subject"]
         response["base_is_ancestor"] = context["base_is_ancestor"]
         response["base_is_descendant"] = context["base_is_descendant"]
+    if context["base_empty_tree"]:
+        response["base_empty_tree"] = True
     return response
 
 
@@ -2604,17 +2670,21 @@ def collect_range_files(repo_root, base_sha, target_sha):
     return displayable_files(read_range_files(repo_root, base_sha, target_sha))
 
 
-def read_range_files(repo_root, base_sha, target_sha):
+def read_range_files(repo_root, base_sha, target_sha, with_counts=True):
     """Changed-file list between two revisions (both already validated),
-    with surrogate-escaped paths."""
-    outputs = run_git_side_by_side(
-        [
-            ["diff", "-M", "--name-status", "-z", base_sha, target_sha, "--"],
-            ["diff", "-M", "--numstat", "-z", base_sha, target_sha, "--"],
-        ],
-        repo_root,
-    )
-    return join_diff_listings(outputs[0], outputs[1])
+    with surrogate-escaped paths.
+
+    with_counts=False skips the --numstat listing, which reads every changed
+    file: entries then carry adds 0, dels 0 and binary False, for callers
+    that count one path themselves.
+    """
+    listing_commands = [["diff", "-M", "--name-status", "-z", base_sha, target_sha, "--"]]
+    if with_counts:
+        listing_commands.append(["diff", "-M", "--numstat", "-z", base_sha, target_sha, "--"])
+    outputs = run_git_side_by_side(listing_commands, repo_root)
+    if with_counts:
+        return join_diff_listings(outputs[0], outputs[1])
+    return join_diff_listings(outputs[0], b"")
 
 
 def collect_commit_files(repo_root, commit):
@@ -2706,6 +2776,15 @@ def get_commit_diff(repo_root, commit_sha, base_sha=None):
         base_record = None
         base_is_ancestor = True
         base_is_descendant = False
+    elif base_sha == EMPTY_TREE_BASE:
+        # Compared with nothing: every file in the commit's tree is added.
+        # git answers no ancestry question about a tree: they are set here.
+        base_record = None
+        files = collect_range_files(repo_root, empty_tree_id(commit["sha"]), commit["sha"])
+        mode = "range"
+        base_is_ancestor = True
+        base_is_descendant = False
+        explanation = f'Everything up to "{subject}", compared with nothing (its whole history).'
     else:
         base_record = resolve_graph_commit(base_sha, graph_commits)
         files = collect_range_files(repo_root, base_record["sha"], commit["sha"])
@@ -2755,31 +2834,45 @@ def get_commit_diff(repo_root, commit_sha, base_sha=None):
         "total_adds": total_adds,
         "total_dels": total_dels,
     }
-    if base_record is not None:
+    if base_sha is not None:
         response["base_override"] = True
-        response["base_subject"] = truncate_subject(base_record["subject"])
         response["base_is_ancestor"] = base_is_ancestor
         response["base_is_descendant"] = base_is_descendant
+        if base_record is None:
+            response["base_subject"] = None
+            response["base_empty_tree"] = True
+        else:
+            response["base_subject"] = truncate_subject(base_record["subject"])
     return response
 
 
 def get_commit_file_patch(repo_root, commit_sha, path, base_sha=None):
-    """Unified diff text for one file of a commit (or of a base..commit range)."""
+    """Unified diff text for one file of a commit (or of a base..commit range).
+
+    base_sha "empty-tree" compares the commit with nothing.
+    """
     graph_commits = read_graph_commits(repo_root)
     commit = resolve_graph_commit(commit_sha, graph_commits)
 
+    # The id the range starts from, None for the commit against its parent.
+    range_start = None
+    range_start_is_ancestor = True
     if base_sha is None:
         if commit["shallow_boundary"]:
             raise GitError(SHALLOW_BOUNDARY_SENTENCE)
-        base_record = None
         files = read_commit_files(repo_root, commit)
     else:
-        base_record = resolve_graph_commit(base_sha, graph_commits)
-        files = read_range_files(repo_root, base_record["sha"], commit["sha"])
+        if base_sha == EMPTY_TREE_BASE:
+            range_start = empty_tree_id(commit["sha"])
+        else:
+            range_start = resolve_graph_commit(base_sha, graph_commits)["sha"]
+            range_start_is_ancestor = is_ancestor_commit(repo_root, range_start, commit["sha"])
+        # A range can hold the whole tree: only this path is counted, below.
+        files = read_range_files(repo_root, range_start, commit["sha"], with_counts=False)
 
     file_entry = find_file_entry(files, path, "by that commit")
 
-    if file_entry["binary"]:
+    if range_start is None and file_entry["binary"]:
         return {
             "path": path,
             "status": file_entry["status"],
@@ -2800,11 +2893,30 @@ def get_commit_file_patch(repo_root, commit_sha, path, base_sha=None):
             changed_paths.append(entry["old_path"])
     path_args = build_exact_pathspecs(target_paths, changed_paths)
 
-    if base_record is not None:
-        patch_text, output_was_cut = run_git_text_limited(
-            ["diff", "-M", base_record["sha"], commit["sha"], "--"] + path_args,
-            cwd=repo_root,
-        )
+    if range_start is not None:
+        revision_args = [range_start, commit["sha"]]
+        # The patch and this one path's --numstat (which says whether git
+        # treats it as binary) side by side, as build_file_patch does.
+        def read_patch():
+            return run_git_text_limited(
+                ["diff", "-M"] + revision_args + ["--"] + path_args, cwd=repo_root,
+            )
+        def read_one_count():
+            return run_git(
+                ["diff", "-M", "--numstat", "-z"] + revision_args + ["--"] + path_args,
+                cwd=repo_root,
+            )
+        patch_result, numstat_raw = run_side_by_side(lambda job: job(), [read_patch, read_one_count])
+        patch_text, output_was_cut = patch_result
+        counts = parse_numstat(numstat_raw.decode("utf-8", errors="surrogateescape").lstrip("\n"))
+        if counts.get(file_entry["path"], (0, 0, False))[2]:
+            return {
+                "path": path,
+                "status": file_entry["status"],
+                "binary": True,
+                "truncated": False,
+                "patch": "",
+            }
     elif len(commit["parents"]) >= 1:
         patch_text, output_was_cut = run_git_text_limited(
             ["diff", "-M", commit["sha"] + "^1", commit["sha"], "--"] + path_args,
@@ -2828,10 +2940,8 @@ def get_commit_file_patch(repo_root, commit_sha, path, base_sha=None):
         "truncated": truncated,
         "patch": patch_text,
     }
-    if base_record is not None:
-        response["base_is_ancestor"] = is_ancestor_commit(
-            repo_root, base_record["sha"], commit["sha"]
-        )
+    if range_start is not None:
+        response["base_is_ancestor"] = range_start_is_ancestor
     return response
 
 
