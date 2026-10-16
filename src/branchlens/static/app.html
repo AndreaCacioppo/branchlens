@@ -448,7 +448,11 @@ body {
   min-width: 0;
 }
 .beginning-chip {
-  flex: none;
+  /* shrinks when a wide graph column leaves little room; the title has the rest */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-family: inherit;
   font-size: 10px;
   line-height: 1;
@@ -3276,7 +3280,8 @@ function makeTreeCommitRow(displayRow, svgWidth) {
     compareChip.type = "button";
     compareChip.addEventListener("click", function (event) {
       event.stopPropagation();
-      setBaseCommit(commit.sha);
+      pickBaseInTree(commit.sha, compareChip,
+        "Comparing with " + commit.sha.slice(0, 7) + ", " + (commit.subject || ""));
     });
     row.appendChild(compareChip);
   }
@@ -3436,12 +3441,24 @@ function makeTreeBeginningEntry(svgWidth) {
     button.type = "button";
     button.title = explanation;
     button.addEventListener("click", function () {
-      setBaseCommit(EMPTY_TREE_BASE);
+      pickBaseInTree(EMPTY_TREE_BASE, button,
+        "Comparing with nothing: every file and every commit counts as new.");
     });
     entry.appendChild(button);
     entry.appendChild(makeText("span", "tree-beginning-text", "before the first commit"));
   }
   return entry;
+}
+
+// Picks a base with a Tree control that the tree's redraw removes: keyboard
+// focus goes back to the tree list, and a screen reader hears the change.
+function pickBaseInTree(sha, control, spoken) {
+  var hadFocus = document.activeElement === control;
+  setBaseCommit(sha);
+  if (hadFocus) {
+    treeListElement.focus();
+  }
+  announce(spoken);
 }
 
 function updateTreeSelection() {
@@ -3544,6 +3561,8 @@ function afterGraphRefresh() {
     if (hasSelection()) {
       loadDiff();
     }
+  } else if (baseSha !== null && baseSha !== EMPTY_TREE_BASE) {
+    updateRunCard(); // the graph now knows the picked commit's subject
   }
   if (selectedCommitSha !== null && !graphHasSha(selectedCommitSha)) {
     handleCommitVanished();
@@ -5187,14 +5206,15 @@ function loadDiff() {
       return; // stale response: the selection or base changed meanwhile
     }
     if (result.status === 404) {
-      if (requestBase !== null) {
+      if (requestBase !== null && requestBase !== EMPTY_TREE_BASE) {
         // The base may have left the history before the graph noticed: drop
         // it and retry, keeping the selection. The retry reports a branch or
-        // commit that is really gone.
+        // commit that is really gone. The empty tree never leaves.
         baseSha = null;
         rememberViewInAddress();
         renderTreeIfChanged();
         renderHeader();
+        updateRunCard(); // Run no longer sends that base
         loadDiff();
         return;
       }
@@ -8076,6 +8096,12 @@ function selectionIsJudged(view) {
     return false;
   }
   if (baseSha !== null && !pickedBaseWasJudged(view)) {
+    return false;
+  }
+  // A run from a picked commit judged only the commits after it; with no
+  // base picked, the files on screen reach further back.
+  if (baseSha === null && view.feed !== null && typeof view.feed.base === "string" &&
+      COMMIT_ID_PATTERN.test(view.feed.base)) {
     return false;
   }
   if (selectedCommitSha !== null) {

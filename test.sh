@@ -6562,7 +6562,7 @@ FEATURE_TIP=$(git -C "$RUN_WT" rev-parse HEAD)
 json_check "push: allowed after READY TO PUBLISH on the branch's current tip" "$RUN_SEC" \
   'data["push"]["allowed"] is True and data["push"]["branch"] == "feature" and data["push"]["remote"] == "origin" and data["push"]["commit"] == extra and data["push"]["pushed"] is None and data["push"]["output"] is None' "$FEATURE_TIP"
 json_check "push: the reason is the exact command, with the upstream step for a branch with no upstream" "$RUN_SEC" \
-  'data["push"]["reason"] == "Will run git push --recurse-submodules=no --no-follow-tags origin " + extra + ":refs/heads/feature, then git branch --set-upstream-to=refs/remotes/origin/feature feature."' "$FEATURE_TIP"
+  'data["push"]["reason"] == "Will run git push --recurse-submodules=no --no-follow-tags origin " + extra + "^{commit}:refs/heads/feature, then git branch --set-upstream-to=refs/remotes/origin/feature feature."' "$FEATURE_TIP"
 json_check "judged: a finished run names the branch and commit its verdict.json records" "$RUN_SEC" \
   'data["judged"] == {"branch": "feature", "commit": extra}' "$FEATURE_TIP"
 RUN_STATE="$FIXTURE/run-state.json"
@@ -6787,14 +6787,14 @@ STATUS=$(http_post "$RUN_PORT" "$POST_BODY" "/api/push" "$RUN_TOKEN" \
   "application/json" '{"branch": "feature"}')
 expect_status "200" "push: a push after READY TO PUBLISH answers HTTP 200"
 json_check "push: the push succeeds and returns git's own output" "$POST_BODY" \
-  'data["pushed"] is True and extra + " -> feature" in data["output"]' "$FEATURE_TIP"
+  'data["pushed"] is True and extra + "^{commit} -> feature" in data["output"]' "$FEATURE_TIP"
 [ "$(git --git-dir="$RUN_ORIGIN" rev-parse -q --verify refs/heads/feature)" = "$FEATURE_TIP" ]
 check "push: the bare origin now has feature at the checked commit" $?
 [ "$(git -C "$RUN_REPO" config --get branch.feature.remote)" = "origin" ]
 check "push: the upstream step made origin the branch's upstream" $?
 http_get "$RUN_PORT" "$RUN_SEC" "/api/security" > /dev/null
 json_check "push: /api/security reports the push and its output" "$RUN_SEC" \
-  'data["push"]["pushed"] is True and extra + " -> feature" in data["push"]["output"]' "$FEATURE_TIP"
+  'data["push"]["pushed"] is True and extra + "^{commit} -> feature" in data["push"]["output"]' "$FEATURE_TIP"
 ALREADY_PUSHED_REASON="Already pushed: origin/feature is at ${FEATURE_TIP:0:7}."
 json_check "push: once origin/feature is at the tip, no second push is offered" "$RUN_SEC" \
   'data["push"]["allowed"] is False and data["push"]["reason"] == extra' "$ALREADY_PUSHED_REASON"
@@ -7045,7 +7045,7 @@ http_get "$RUN_PORT" "$RUN_SEC" "/api/security" > /dev/null
 json_check "rejected push: the push is allowed on BranchLens's side" "$RUN_SEC" \
   'data["push"]["allowed"] is True and data["push"]["commit"] == extra' "$MOVED_TIP"
 json_check "push: with an upstream the next push has no upstream step" "$RUN_SEC" \
-  'data["push"]["reason"] == "Will run git push --recurse-submodules=no --no-follow-tags origin " + extra + ":refs/heads/feature."' "$MOVED_TIP"
+  'data["push"]["reason"] == "Will run git push --recurse-submodules=no --no-follow-tags origin " + extra + "^{commit}:refs/heads/feature."' "$MOVED_TIP"
 STATUS=$(http_post "$RUN_PORT" "$POST_BODY" "/api/push" "$RUN_TOKEN" \
   "application/json" '{"branch": "feature"}')
 expect_status "200" "rejected push: POST /api/push answers HTTP 200"
@@ -7326,7 +7326,7 @@ json_check "first publish: with a remote that lacks main, the run's base is empt
   'data == {"started": True, "branch": "main", "base": "empty-tree"}'
 http_get "$FP_PORT" "$FP_SEC" "/api/security" > /dev/null
 json_check "first publish: a READY run allows the first push of main" "$FP_SEC" \
-  'data["push"]["allowed"] is True and data["push"]["reason"] == "Will run git push --recurse-submodules=no --no-follow-tags origin " + extra + ":refs/heads/main, then git branch --set-upstream-to=refs/remotes/origin/main main."' "$FP_TIP"
+  'data["push"]["allowed"] is True and data["push"]["reason"] == "Will run git push --recurse-submodules=no --no-follow-tags origin " + extra + "^{commit}:refs/heads/main, then git branch --set-upstream-to=refs/remotes/origin/main main."' "$FP_TIP"
 STATUS=$(http_post "$FP_PORT" "$POST_BODY" "/api/push" "$FP_TOKEN" "application/json" '{"branch": "main"}')
 expect_status "200" "first publish: pushing main answers HTTP 200"
 json_check "first publish: the push succeeds" "$POST_BODY" 'data["pushed"] is True'
@@ -7594,12 +7594,12 @@ git -C "$GATE_REPO" tag -d origin/main > /dev/null
 # ---- the push sends the judged commit and nothing else (g9, g8) ----------------
 
 json_check "push gate: the reason shows both commands, with the full commit id" "$GATE_SEC" \
-  'data["push"]["allowed"] is True and data["push"]["reason"] == "Will run git push --recurse-submodules=no --no-follow-tags origin " + extra + ":refs/heads/gated, then git branch --set-upstream-to=refs/remotes/origin/gated gated."' "$GATE_TIP"
+  'data["push"]["allowed"] is True and data["push"]["reason"] == "Will run git push --recurse-submodules=no --no-follow-tags origin " + extra + "^{commit}:refs/heads/gated, then git branch --set-upstream-to=refs/remotes/origin/gated gated."' "$GATE_TIP"
 touch "$GATE_SHIM/armed"
 STATUS=$(http_post "$GATE_PORT" "$GATE_POST" "/api/push" "$GATE_TOKEN" "application/json" '{"branch": "gated"}')
 expect_status "200" "push gate: POST /api/push answers HTTP 200"
 json_check "push gate: the push goes through and the upstream step's output follows git's" "$GATE_POST" \
-  'data["pushed"] is True and extra + " -> gated" in data["output"] and "set up to track" in data["output"]' "$GATE_TIP"
+  'data["pushed"] is True and extra + "^{commit} -> gated" in data["output"] and "set up to track" in data["output"]' "$GATE_TIP"
 GATE_LANDED=$(git -C "$GATE_WT" rev-parse HEAD)
 [ ! -e "$GATE_SHIM/armed" ] && [ "$GATE_LANDED" != "$GATE_TIP" ]
 check "push gate: a commit landed on gated as the push started" $?
@@ -7631,7 +7631,7 @@ git -C "$GATE_WT" commit -q -am "Gated: second step"
 GATE_TIP2=$(git -C "$GATE_WT" rev-parse HEAD)
 gate_run '{"branch": "gated", "base": "'"$GATE_LANDED"'"}'
 check "unjudged history: a run that judges only the newest commit finishes" $?
-UNJUDGED_REASON="The check judged only ${GATE_LANDED:0:7}..${GATE_TIP2:0:7}; the push would also send 1 older commit it never judged: run the check again with no commit picked as its base, or compare from the beginning."
+UNJUDGED_REASON="The check judged only ${GATE_LANDED:0:7}..${GATE_TIP2:0:7}; the push would also send 1 older commit it never judged: run the check from a commit origin already has, or compare from the beginning."
 http_get "$GATE_PORT" "$GATE_SEC" "/api/security" > /dev/null
 json_check "unjudged history: READY on a narrow range leaves Push off, naming the range and the rest" "$GATE_SEC" \
   'data["verdict_word"] == "READY TO PUBLISH" and data["push"]["allowed"] is False and data["push"]["reason"] == extra' "$UNJUDGED_REASON"
@@ -7799,7 +7799,7 @@ rm -f "$GATE_TOOLKIT/knobs"
 
 git -C "$GATE_REPO" remote add fork "$GATE_FORK"
 git -C "$GATE_REPO" push -q fork main
-GATE_VIA_FORK="Will run git push --recurse-submodules=no --no-follow-tags fork $GATE_TIP2:refs/heads/gated."
+GATE_VIA_FORK="Will run git push --recurse-submodules=no --no-follow-tags fork $GATE_TIP2^{commit}:refs/heads/gated."
 gate_terminal_run "push-remote-run" "$GATE_CHECK_FIELDS" "" "READY TO PUBLISH"
 git -C "$GATE_REPO" config branch.gated.pushRemote fork
 http_get "$GATE_PORT" "$GATE_SEC" "/api/security" > /dev/null
@@ -7815,7 +7815,7 @@ json_check "push remote: remote.pushDefault counts too, and a push remote never 
 git -C "$GATE_REPO" config --unset remote.pushDefault
 http_get "$GATE_PORT" "$GATE_SEC" "/api/security" > /dev/null
 json_check "push remote: with neither and no upstream, the push goes to origin with the upstream step" "$GATE_SEC" \
-  'data["push"]["remote"] == "origin" and data["push"]["reason"] == "Will run git push --recurse-submodules=no --no-follow-tags origin " + extra + ":refs/heads/gated, then git branch --set-upstream-to=refs/remotes/origin/gated gated."' "$GATE_TIP2"
+  'data["push"]["remote"] == "origin" and data["push"]["reason"] == "Will run git push --recurse-submodules=no --no-follow-tags origin " + extra + "^{commit}:refs/heads/gated, then git branch --set-upstream-to=refs/remotes/origin/gated gated."' "$GATE_TIP2"
 git -C "$GATE_REPO" config branch.gated.remote origin
 git -C "$GATE_REPO" config branch.gated.merge refs/heads/gated
 
@@ -8194,7 +8194,7 @@ pick_run() {
   [ "$status" = "200" ] && wait_for_security "$PICK_PORT" 'data["runner"]["active"] is False' && \
     http_get "$PICK_PORT" "$PICK_SEC" "/api/security" > /dev/null
 }
-PICK_UNJUDGED_REASON="The check judged only ${PICK_C2:0:7}..${PICK_C3:0:7}; the push would also send 1 older commit it never judged: run the check again with no commit picked as its base, or compare from the beginning."
+PICK_UNJUDGED_REASON="The check judged only ${PICK_C2:0:7}..${PICK_C3:0:7}; the push would also send 1 older commit it never judged: run the check from a commit origin already has, or compare from the beginning."
 
 # A narrow base: the second step, which the remote lacks.
 pick_run '{"branch": "topic", "base": "'"$PICK_C2"'"}'
@@ -8222,23 +8222,30 @@ json_check "picked base push: --no-push-host still keeps Push off after a whole-
   'data["verdict_word"] == "READY TO PUBLISH" and data["base"] == "empty-tree" and data["push"]["allowed"] is False and data["push"]["reason"] == "Repositories on code.work.example are pushed from another machine: port the change by hand."'
 STATUS=$(http_post "$PICK_PORT" "$PICK_POST" "/api/push" "$PICK_TOKEN" "application/json" '{"branch": "topic"}')
 expect_status "409" "picked base push: POST /api/push to a blocked host is refused with HTTP 409"
-# A whole-history run needs no knowledge of what the push address has.
-git -C "$PICK_REPO" config remote.origin.pushurl "$PICK_OTHER"
-http_get "$PICK_PORT" "$PICK_SEC" "/api/security" > /dev/null
-json_check "picked base push: after a whole-history READY, a pushurl elsewhere is no reason to refuse" "$PICK_SEC" \
-  'data["push"]["allowed"] is True'
 git -C "$PICK_REPO" config --unset remote.origin.pushurl
 http_get "$PICK_PORT" "$PICK_SEC" "/api/security" > /dev/null
 json_check "picked base push: after a whole-history READY, Push is allowed though the remote lacks older commits" "$PICK_SEC" \
   'data["push"]["allowed"] is True and data["push"]["commit"] == extra' "$PICK_C3"
+# A whole-history run needs no knowledge of what the push address has: with
+# a pushurl elsewhere, the commits go there. A tag named like the judged
+# tip's id, on a commit no check judged, does not change what is sent.
+git -C "$PICK_REPO" config remote.origin.pushurl "$PICK_OTHER"
+PICK_UNJUDGED=$(git -C "$PICK_REPO" commit-tree "$PICK_C3^{tree}" -p "$PICK_C3" -m "Never judged")
+git -C "$PICK_REPO" tag "$PICK_C3" "$PICK_UNJUDGED"
+http_get "$PICK_PORT" "$PICK_SEC" "/api/security" > /dev/null
+json_check "picked base push: after a whole-history READY, a pushurl elsewhere is no reason to refuse" "$PICK_SEC" \
+  'data["push"]["allowed"] is True and data["push"]["commit"] == extra' "$PICK_C3"
 STATUS=$(http_post "$PICK_PORT" "$PICK_POST" "/api/push" "$PICK_TOKEN" "application/json" '{"branch": "topic"}')
 expect_status "200" "picked base push: POST /api/push after the whole-history run answers HTTP 200"
 json_check "picked base push: the push went through" "$PICK_POST" 'data["pushed"] is True'
-[ "$(git --git-dir="$PICK_ORIGIN" rev-parse -q --verify refs/heads/topic)" = "$PICK_C3" ] && \
-  git --git-dir="$PICK_ORIGIN" cat-file -e "$PICK_C2" 2>/dev/null
-check "picked base push: the remote now has the tip and the second step" $?
-[ -z "$(git --git-dir="$PICK_OTHER" for-each-ref)" ]
-check "picked base push: the other address got nothing" $?
+[ "$(git --git-dir="$PICK_OTHER" rev-parse -q --verify refs/heads/topic)" = "$PICK_C3" ] && \
+  git --git-dir="$PICK_OTHER" cat-file -e "$PICK_C2" 2>/dev/null && \
+  ! git --git-dir="$PICK_OTHER" cat-file -e "$PICK_UNJUDGED" 2>/dev/null
+check "picked base push: the push address got the judged tip and the step before it, not the commit the tag names" $?
+[ "$(git --git-dir="$PICK_ORIGIN" rev-parse -q --verify refs/heads/topic)" = "$PICK_C1" ]
+check "picked base push: the fetch address got nothing" $?
+git -C "$PICK_REPO" tag -d "$PICK_C3" > /dev/null
+git -C "$PICK_REPO" config --unset remote.origin.pushurl
 
 # The base a run was started with is the one its records must name: a
 # verdict.json rewritten to the empty tree after a narrow run started here
@@ -8273,6 +8280,26 @@ PY
 http_get "$PICK_PORT" "$PICK_SEC" "/api/security" > /dev/null
 json_check "picked base push: a run folder rewritten to the whole history after a narrow run started here keeps Push off" "$PICK_SEC" \
   'data["push"]["allowed"] is False and data["push"]["reason"] == "The latest check records another base than the one BranchLens started it with: run the check again."'
+# The server knows its run by the first run_id the log named: a log
+# rewritten later to name another run changes nothing.
+python3 - "$PICK_REPORTS" <<'PY'
+import glob
+import os
+import sys
+
+logs = glob.glob(os.path.join(sys.argv[1], "branchlens-run-*.log"))
+if len(logs) != 1:
+    sys.exit(1)
+lines = open(logs[0], encoding="utf-8").read().split("\n")
+for index, line in enumerate(lines):
+    if line.startswith("report in: "):
+        lines[index] = "report in: " + os.path.join(sys.argv[1], "some-other-run")
+open(logs[0], "w", encoding="utf-8").write("\n".join(lines))
+PY
+check "picked base push: in the fixture the run log now names another run" $?
+http_get "$PICK_PORT" "$PICK_SEC" "/api/security" > /dev/null
+json_check "picked base push: a run log rewritten afterwards still leaves the started base in force" "$PICK_SEC" \
+  'data["push"]["allowed"] is False and data["push"]["reason"] == "The latest check records another base than the one BranchLens started it with: run the check again." and data["runner"]["run_id"] == data["run_id"]'
 
 # A replace ref can graft history a remote has on top of a local commit; the
 # count of commits a push would send ignores it, as the push itself does.
@@ -8300,6 +8327,42 @@ check "picked base push: under the graft, a run from the fourth step starts and 
 json_check "picked base push: under the graft, that narrow run still leaves Push off" "$PICK_SEC" \
   'data["verdict_word"] == "READY TO PUBLISH" and data["push"]["allowed"] is False and " the push would also send 1 older commit " in data["push"]["reason"]'
 git -C "$PICK_REPO" replace -d "$PICK_SIDE" > /dev/null
+# A graft can also move the merge base: with the fifth step grafted onto the
+# third, plain git finds the third where the fourth and fifth meet. The
+# gating reads find the fourth, as the toolkit and the push do, so a verdict
+# from the fourth step (no review-scope.json) still keeps Push off.
+git -C "$PICK_REPO" replace --graft "$PICK_C5" "$PICK_C3"
+[ "$(git -C "$PICK_REPO" merge-base "$PICK_C4" "$PICK_C5")" = "$PICK_C3" ]
+check "picked base push: in the fixture the graft moves plain git's merge base" $?
+python3 - "$PICK_REPO" "$PICK_REPORTS" "$PICK_C4" "$PICK_C5" <<'PY'
+import json
+import os
+import sys
+
+from branchlens import gitops
+from branchlens import publish
+
+repo, reports, base_commit, tip = sys.argv[1:5]
+if gitops.find_judged_merge_base(repo, base_commit, tip) != base_commit:
+    sys.exit(1)
+folder = os.path.join(reports, "unit-graft")
+os.makedirs(folder, exist_ok=True)
+verdict = {"verdict": "READY TO PUBLISH", "exit_code": 0, "review_merged": True,
+           "review_confirmed": True, "mode": "check", "base_ref": base_commit,
+           "repository": {"path": repo, "branch": "topic", "commit": tip}}
+json.dump(verdict, open(os.path.join(folder, "verdict.json"), "w"))
+status = publish.check_push(
+    repo, reports, run_id="unit-graft", feed_running=False,
+    feed_verdict_word="READY TO PUBLISH", cancelled_run_id=None,
+    run_active=False, active_branch=None, active_commit=None,
+    blocked_host_suffixes=[], feed_findings=[], started_base=None)
+if status["allowed"] or " the push would also send 1 older commit " not in status["reason"]:
+    print(status["reason"])
+    sys.exit(1)
+sys.exit(0)
+PY
+check "picked base push: a graft that moves the merge base does not move the start of the judged history" $?
+git -C "$PICK_REPO" replace -d "$PICK_C5" > /dev/null
 
 # The same decisions, read straight from publish: judged_fork_commit gives
 # the start of the judged history, and check_push decides on it.
@@ -8367,6 +8430,50 @@ for problem in problems:
 sys.exit(1 if problems else 0)
 PY
 check "picked base push: publish decides alike: narrow refused, whole history allowed, a different or forged base refused" $?
+
+# ---- Run in a shallow clone ---------------------------------------------------------
+# When the clone stops before the point where the branch and its base meet,
+# Run says so, as the diff does, rather than calling the histories unrelated.
+
+SHALLOW_RUN_ORIGIN="$FIXTURE/shallow-run-origin"
+SHALLOW_RUN_CLONE="$FIXTURE/shallow-run-clone"
+SHALLOW_RUN_TOOLKIT="$FIXTURE/shallow-run-toolkit"
+SHALLOW_RUN_POST="$FIXTURE/shallow-run-post.json"
+new_repo "$SHALLOW_RUN_ORIGIN"
+printf 'one\n' > "$SHALLOW_RUN_ORIGIN/base.txt"
+git -C "$SHALLOW_RUN_ORIGIN" add -A
+git -C "$SHALLOW_RUN_ORIGIN" commit -q -m "fork point"
+git -C "$SHALLOW_RUN_ORIGIN" checkout -q -b feature
+printf 'feature\n' > "$SHALLOW_RUN_ORIGIN/feature.txt"
+git -C "$SHALLOW_RUN_ORIGIN" add -A
+git -C "$SHALLOW_RUN_ORIGIN" commit -q -m "feature work"
+git -C "$SHALLOW_RUN_ORIGIN" checkout -q main
+printf 'two\n' >> "$SHALLOW_RUN_ORIGIN/base.txt"
+git -C "$SHALLOW_RUN_ORIGIN" commit -q -am "main work"
+git clone -q --depth 1 --no-single-branch "file://$SHALLOW_RUN_ORIGIN" "$SHALLOW_RUN_CLONE"
+git -C "$SHALLOW_RUN_CLONE" worktree add -q -b feature "$SHALLOW_RUN_CLONE-feature" origin/feature
+! git -C "$SHALLOW_RUN_CLONE" merge-base origin/main feature > /dev/null
+check "shallow run: in the fixture git finds no point where feature and origin/main meet" $?
+mkdir -p "$SHALLOW_RUN_TOOLKIT"
+cp "$TOOLKIT/preflight.sh" "$SHALLOW_RUN_TOOLKIT/preflight.sh"
+SHALLOW_RUN_LOG="$FIXTURE/server-shallow-run.log"
+python3 -m branchlens "$SHALLOW_RUN_CLONE" --port 0 --no-browser \
+  --toolkit "$SHALLOW_RUN_TOOLKIT" --security-feed "$FIXTURE/shallow-run-reports/security-feed.jsonl" \
+  > "$SHALLOW_RUN_LOG" 2>&1 &
+echo "$!" >> "$FIXTURE/extra-pids"
+SHALLOW_RUN_PORT=$(wait_for_server "$SHALLOW_RUN_LOG")
+check "shallow run: server starts on a shallow clone with a toolkit" $?
+SHALLOW_RUN_TOKEN=$(page_token "$SHALLOW_RUN_PORT")
+SHALLOW_RUN_MAIN=$(git -C "$SHALLOW_RUN_CLONE" rev-parse refs/remotes/origin/main)
+for shallow_body in '{"branch": "feature"}' '{"branch": "feature", "base": "'"$SHALLOW_RUN_MAIN"'"}'; do
+  STATUS=$(http_post "$SHALLOW_RUN_PORT" "$SHALLOW_RUN_POST" "/api/run" "$SHALLOW_RUN_TOKEN" \
+    "application/json" "$shallow_body")
+  expect_status "400" "shallow run: $shallow_body answers HTTP 400"
+  json_check "shallow run: $shallow_body is refused because the clone is shallow" "$SHALLOW_RUN_POST" \
+    '"This clone is shallow and does not reach the commit where " in data["error"] and "git fetch --unshallow" in data["error"] and "shares no history" not in data["error"]'
+done
+[ ! -e "$SHALLOW_RUN_TOOLKIT/last-call.json" ]
+check "shallow run: the toolkit was never started" $?
 
 # ---- the page's Content-Security-Policy and the common headers (g155) -------------
 
@@ -8767,11 +8874,26 @@ if tree.index('"· showing the latest "') > tree.index("makeTreeBeginningEntry(s
     sys.exit(1)
 entry = function_body("makeTreeBeginningEntry")
 if 'makeText("button", "beginning-chip", "compare from the beginning")' not in entry or \
-        "setBaseCommit(EMPTY_TREE_BASE);" not in entry or 'button.type = "button";' not in entry:
+        "pickBaseInTree(EMPTY_TREE_BASE, button," not in entry or 'button.type = "button";' not in entry:
     sys.exit(1)
-# Unlike a commit's compare chip, it needs no hover to show.
+# Picking a base from the Tree keeps keyboard focus in the tree list and says
+# what changed; the compare chips do the same.
+pick = function_body("pickBaseInTree")
+if "setBaseCommit(sha);" not in pick or "treeListElement.focus();" not in pick or \
+        "announce(spoken);" not in pick or "pickBaseInTree(commit.sha, compareChip," not in text:
+    sys.exit(1)
+# Unlike a commit's compare chip, it needs no hover to show, and it shrinks
+# when a wide graph column leaves little room.
 rule_start = text.index(".beginning-chip {")
-if "display: none" in text[rule_start:text.index("}", rule_start)]:
+rule = text[rule_start:text.index("}", rule_start)]
+if "display: none" in rule or "flex: 0 1 auto;" not in rule or "min-width: 0;" not in rule:
+    sys.exit(1)
+# A picked commit's subject reaches the Run card once the graph is in.
+if "updateRunCard(); // the graph now knows the picked commit's subject" not in function_body("afterGraphRefresh"):
+    sys.exit(1)
+# After a run from a picked commit, the badges go off once no base is picked.
+judged = function_body("selectionIsJudged")
+if "baseSha === null && view.feed !== null" not in judged or "COMMIT_ID_PATTERN.test(view.feed.base)" not in judged:
     sys.exit(1)
 # The empty tree is in no graph: neither a graph refresh nor a reload drops it.
 if "baseSha !== EMPTY_TREE_BASE && !graphHasSha(baseSha)" not in function_body("afterGraphRefresh"):
@@ -9401,11 +9523,14 @@ select = function_body("selectFile")
 if "renderDiffBody();" not in select or select.index("renderDiffBody();") > select.index("loadFile();"):
     sys.exit(1)
 # a 404 with a compare base drops the base and asks again, whatever the
-# cached graph says; the file loader lets the comparison decide
+# cached graph says, except the empty tree, which never leaves the history;
+# the file loader lets the comparison decide
 diff = function_body("loadDiff")
 if "requestBase !== null && !graphHasSha(requestBase)" in text:
     sys.exit(1)
-if "if (result.status === 404) {\n      if (requestBase !== null) {" not in diff:
+if "if (result.status === 404) {\n      if (requestBase !== null && requestBase !== EMPTY_TREE_BASE) {" not in diff:
+    sys.exit(1)
+if "updateRunCard();" not in diff[diff.index("if (result.status === 404) {"):]:
     sys.exit(1)
 file_body = function_body("loadFile")
 start = file_body.index("if (result.status === 404) {")

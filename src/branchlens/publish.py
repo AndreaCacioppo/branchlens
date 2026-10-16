@@ -660,7 +660,8 @@ def unjudged_history_problem(push_directory, folder, verdict, remote_name, tip,
 
     started_base is the base BranchLens handed to preflight.sh when it
     started this run itself, else None. The verdict must then record that
-    same base.
+    same base. This catches a rewrite of that run's folder, not a run
+    forged beside it: the run files and the feed are trusted.
     """
     if started_base is not None and verdict.get("base_ref") != started_base:
         return BASE_MISMATCH_REASON
@@ -696,8 +697,8 @@ def unjudged_history_problem(push_directory, folder, verdict, remote_name, tip,
         commits_text = str(count) + " older commits"
     return ("The check judged only " + fork_commit[:7] + ".." + tip[:7]
             + "; the push would also send " + commits_text + " it never "
-            "judged: run the check again with no commit picked as its base, "
-            "or compare from the beginning.")
+            "judged: run the check from a commit " + remote_name + " already "
+            "has, or compare from the beginning.")
 
 
 def check_push(repo_root, reports_root, run_id, feed_running, feed_verdict_word,
@@ -876,12 +877,14 @@ def push_command(working_directory, remote_name, branch, commit):
     """The push, as an argument list: the judged commit onto refs/heads/<branch>.
 
     The source is the commit id: a commit made after the last look at the
-    tip is never sent. --recurse-submodules=no and --no-follow-tags keep the
-    push to that commit whatever push.recurseSubmodules, submodule.recurse
-    or push.followTags say.
+    tip is never sent. It ends in ^{commit}: git push matches a bare source
+    against ref names first, so a tag or branch named like the id would
+    send another commit; no ref name can hold "^". --recurse-submodules=no
+    and --no-follow-tags keep the push to that commit whatever
+    push.recurseSubmodules, submodule.recurse or push.followTags say.
     """
     return ["git", "-C", working_directory, "push", "--recurse-submodules=no",
-            "--no-follow-tags", remote_name, commit + ":refs/heads/" + branch]
+            "--no-follow-tags", remote_name, commit + "^{commit}:refs/heads/" + branch]
 
 
 def upstream_command(working_directory, remote_name, branch):

@@ -716,6 +716,15 @@ class BranchLensHandler(BaseHTTPRequestHandler):
         # history instead.
         if base_commit is not None:
             fork_commit = gitops.find_judged_merge_base(self.repo_root, base_commit, tip)
+            if fork_commit == "" and len(gitops.read_shallow_boundary(self.repo_root)) > 0:
+                # The meeting point may lie past the edge of the clone.
+                self.send_json(400, {
+                    "error": "This clone is shallow and does not reach the commit where '"
+                             + branch + "' and '" + short_base_name(base_label) + "' meet. "
+                             "Run 'git fetch --unshallow' (or --deepen=N), then run the "
+                             "check again."
+                })
+                return
             if fork_commit == "":
                 self.send_json(400, {
                     "error": short_base_name(base_label) + " shares no history with "
