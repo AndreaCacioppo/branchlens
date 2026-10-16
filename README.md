@@ -51,7 +51,8 @@ only on repositories you trust.
 The base is the one the page shows. By default that is where the branch
 forked from `origin/main`, or, for the default branch, its online copy. A
 commit picked with "compare from here" in Tree limits the run to the commits
-after it. "compare from the beginning", at the bottom of Tree, compares with
+after it; for a commit on another line of history, to the branch's commits
+since the two lines meet. "compare from the beginning", at the bottom of Tree, compares with
 nothing: every commit and every file counts as new, so a branch that is
 already published can be checked whole. Such a run takes longer and also
 reports problems older work left behind.
