@@ -957,6 +957,11 @@ def push_branch(working_directory, remote_name, branch, commit, set_upstream):
     # would point git at another repository than the branch's worktree.
     for name in GIT_LOCATION_VARIABLES:
         environment.pop(name, None)
+    # Config from the environment (GIT_CONFIG_COUNT and its keys,
+    # GIT_CONFIG_PARAMETERS) could send the push to another address, such as
+    # a remote.<name>.pushurl, than the one check_push read without it.
+    gitops.strip_config_overrides(environment)
+    environment.pop("GIT_CONFIG_COUNT", None)
     environment["GIT_TERMINAL_PROMPT"] = "0"
     pushed, output = run_command(
         push_command(working_directory, remote_name, branch, commit),
