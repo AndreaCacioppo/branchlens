@@ -2323,17 +2323,34 @@ def get_diff(repo_root, branch, base_sha=None):
     return response
 
 
-def get_file_patch(repo_root, branch, path, base_sha=None):
-    """Unified diff text for one file, for /api/file."""
+def get_file_patch(repo_root, branch, path, base_sha=None, full_context=False):
+    """Unified diff text for one file, for /api/file.
+
+    full_context=True asks for the whole file on both sides (see
+    full_context_diff_args), for /api/file-text.
+    """
     base_record = resolve_base_record(repo_root, base_sha)
     context = build_diff_context(repo_root, branch, base_record)
-    response = build_file_patch(context, path)
+    response = build_file_patch(context, path, full_context)
     if context["base_override"]:
         response["base_is_ancestor"] = context["base_is_ancestor"]
     return response
 
 
-def build_file_patch(context, path):
+def full_context_diff_args(full_context):
+    """The rename and context options of a file's patch.
+
+    Full context puts every line of the file in the patch: a patch under
+    MAX_PATCH_CHARS characters has fewer lines than that. --no-renames shows
+    a rename as the old file deleted and the new one added, so both sides
+    carry their lines.
+    """
+    if full_context:
+        return ["--no-renames", "-U" + str(MAX_PATCH_CHARS)]
+    return ["-M"]
+
+
+def build_file_patch(context, path, full_context=False):
     """The /api/file answer for one path of a branch's change list."""
     files = read_changed_files(context, with_counts=False)
     file_entry = find_file_entry(files, path, f"on '{context['branch']}'")
@@ -2395,7 +2412,8 @@ def build_file_patch(context, path):
         # treats it as binary) side by side.
         def read_patch():
             return run_git_text_limited(
-                ["diff", "-M"] + revision_args + ["--"] + path_args,
+                ["diff"] + full_context_diff_args(full_context) + revision_args
+                + ["--"] + path_args,
                 cwd=diff_cwd,
             )
         def read_one_count():
@@ -2846,10 +2864,11 @@ def get_commit_diff(repo_root, commit_sha, base_sha=None):
     return response
 
 
-def get_commit_file_patch(repo_root, commit_sha, path, base_sha=None):
+def get_commit_file_patch(repo_root, commit_sha, path, base_sha=None, full_context=False):
     """Unified diff text for one file of a commit (or of a base..commit range).
 
-    base_sha "empty-tree" compares the commit with nothing.
+    base_sha "empty-tree" compares the commit with nothing. full_context as
+    in get_file_patch.
     """
     graph_commits = read_graph_commits(repo_root)
     commit = resolve_graph_commit(commit_sha, graph_commits)
@@ -2899,7 +2918,9 @@ def get_commit_file_patch(repo_root, commit_sha, path, base_sha=None):
         # treats it as binary) side by side, as build_file_patch does.
         def read_patch():
             return run_git_text_limited(
-                ["diff", "-M"] + revision_args + ["--"] + path_args, cwd=repo_root,
+                ["diff"] + full_context_diff_args(full_context) + revision_args
+                + ["--"] + path_args,
+                cwd=repo_root,
             )
         def read_one_count():
             return run_git(
@@ -2919,14 +2940,16 @@ def get_commit_file_patch(repo_root, commit_sha, path, base_sha=None):
             }
     elif len(commit["parents"]) >= 1:
         patch_text, output_was_cut = run_git_text_limited(
-            ["diff", "-M", commit["sha"] + "^1", commit["sha"], "--"] + path_args,
+            ["diff"] + full_context_diff_args(full_context)
+            + [commit["sha"] + "^1", commit["sha"], "--"] + path_args,
             cwd=repo_root,
         )
     else:
         # Root commit: 'git show --root' handles the no-parent case; strip
         # the blank line it may print before the patch even with --format=.
         patch_text, output_was_cut = run_git_text_limited(
-            ["show", "--root", "--format=", "-M", commit["sha"], "--"] + path_args,
+            ["show", "--root", "--format="] + full_context_diff_args(full_context)
+            + [commit["sha"], "--"] + path_args,
             cwd=repo_root,
         )
         patch_text = patch_text.lstrip("\n")
@@ -2943,6 +2966,99 @@ def get_commit_file_patch(repo_root, commit_sha, path, base_sha=None):
     if range_start is not None:
         response["base_is_ancestor"] = range_start_is_ancestor
     return response
+
+
+# --- One whole version of a changed file (/api/file-text) ---
+
+HUNK_HEADER_PATTERN = re.compile(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+
+
+def get_file_text(repo_root, side, path, branch=None, commit_sha=None, base_sha=None):
+    """The whole file before ("old") or after ("new") the change, for /api/file-text.
+
+    Read back from the file's full-context patch, in whatever comparison the
+    diff makes.
+    """
+    if branch is not None:
+        file_patch = get_file_patch(repo_root, branch, path, base_sha, full_context=True)
+    else:
+        file_patch = get_commit_file_patch(
+            repo_root, commit_sha, path, base_sha, full_context=True
+        )
+    if file_patch["binary"]:
+        raise GitError("This is a binary file: there is no text to copy.")
+    if file_patch.get("entry_kind") == "directory":
+        raise GitError("This is a directory, not a file: there is no text to copy.")
+    if file_patch["truncated"]:
+        raise GitError("This file is too large to copy whole.")
+    if side == "old" and file_patch["status"] == "A":
+        raise GitError("This file is new: there is no old version to copy.")
+    if side == "new" and file_patch["status"] == "D":
+        raise GitError("This file was deleted: there is no new version to copy.")
+    has_hunk = ("\n" + file_patch["patch"]).find("\n@@ ") >= 0
+    if file_patch["status"] == "M" and not has_hunk:
+        # Only the mode changed: the patch has no lines, and an empty text
+        # would be wrong.
+        raise GitError("Only the file's mode changed, so git shows none of its lines to copy.")
+    return {
+        "path": path,
+        "side": side,
+        "text": patch_side_text(file_patch["patch"], side),
+    }
+
+
+def patch_side_text(patch_text, side):
+    """One side of the file a full-context patch shows.
+
+    The old side is every context and removed line, the new side every
+    context and added line, over all the patch's sections (a rename comes
+    as two). The line counts in each hunk header say where the hunk ends. A "\\ No newline
+    at end of file" line follows the last line of a side that has no final
+    newline.
+    """
+    if side == "old":
+        own_prefix = "-"
+    else:
+        own_prefix = "+"
+    kept_lines = []
+    missing_final_newline = False
+    old_lines_left = 0
+    new_lines_left = 0
+    previous_prefix = None
+    for line in patch_text.split("\n"):
+        if line.startswith("\\"):
+            if previous_prefix == " " or previous_prefix == own_prefix:
+                missing_final_newline = True
+            continue
+        if old_lines_left > 0 or new_lines_left > 0:
+            prefix = line[:1]
+            if prefix == "":
+                prefix = " "  # read as an empty context line, as the page does
+            if prefix == " ":
+                old_lines_left -= 1
+                new_lines_left -= 1
+            elif prefix == "-":
+                old_lines_left -= 1
+            elif prefix == "+":
+                new_lines_left -= 1
+            else:
+                raise GitError("git printed a patch that could not be read back.")
+            if prefix == " " or prefix == own_prefix:
+                kept_lines.append(line[1:])
+            previous_prefix = prefix
+            continue
+        previous_prefix = None
+        header = HUNK_HEADER_PATTERN.match(line)
+        if header is not None:
+            # A count left out of the header means one line.
+            old_lines_left = int(header.group(1)) if header.group(1) is not None else 1
+            new_lines_left = int(header.group(2)) if header.group(2) is not None else 1
+
+    if len(kept_lines) == 0:
+        return ""
+    if missing_final_newline:
+        return "\n".join(kept_lines)
+    return "\n".join(kept_lines) + "\n"
 
 
 # --- Dependency network (/api/network) ---

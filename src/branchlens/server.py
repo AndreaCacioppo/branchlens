@@ -240,6 +240,25 @@ class BranchLensHandler(BaseHTTPRequestHandler):
                         self.repo_root, commit, file_path, base
                     )
                 self.send_json(200, file_patch)
+            elif route == "/api/file-text":
+                # The whole file before or after the change, for the copy buttons.
+                branch = self.read_param(params, "branch")
+                commit = self.read_param(params, "commit")
+                base = self.read_param(params, "base")
+                file_path = self.read_param(params, "path")
+                side = self.read_param(params, "side")
+                if not self.check_target_params(branch, commit):
+                    return
+                if file_path is None:
+                    self.send_json(400, {"error": "Missing 'path' query parameter."})
+                    return
+                if side not in ("old", "new"):
+                    self.send_json(400, {"error": "'side' must be 'old' or 'new'."})
+                    return
+                file_text = gitops.get_file_text(
+                    self.repo_root, side, file_path, branch, commit, base
+                )
+                self.send_json(200, file_text)
             elif route == "/api/network":
                 branch = self.read_param(params, "branch")
                 commit = self.read_param(params, "commit")

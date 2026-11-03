@@ -1479,6 +1479,27 @@ body {
 .mini-header .file-path,
 .mini-header .rename-path { font-size: 12px; }
 .mini-header .file-counts { font-size: 12px; }
+/* copy the whole file: red before the change, green after it */
+.copy-file {
+  flex: none;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+.copy-file.old {
+  border: 1px solid var(--del-fg);
+  background: var(--del-line-bg);
+  color: var(--del-fg);
+}
+.copy-file.new {
+  border: 1px solid var(--add-fg);
+  background: var(--add-line-bg);
+  color: var(--add-fg);
+}
+.copy-file:hover { text-decoration: underline; }
 .banner {
   padding: 6px 12px;
   font-size: 12px;
@@ -4545,6 +4566,39 @@ function makeCard(parts) {
   return holder;
 }
 
+// Copies the whole file before ("old") or after ("new") the change. The
+// text is fetched on click.
+function makeCopyFileButton(path, side) {
+  var button = makeText("button", "copy-file " + side, "copy " + side);
+  button.type = "button";
+  if (side === "old") {
+    button.title = "Copy the whole file as it was before the change";
+  } else {
+    button.title = "Copy the whole file as it is after the change";
+  }
+  button.addEventListener("click", function () {
+    var url = "/api/file-text?" +
+      targetQuery(selectedBranchName, selectedCommitSha, baseSha) +
+      "&path=" + encodeURIComponent(path) + "&side=" + side;
+    fetchJson(url).then(function (result) {
+      if (!result.ok || result.body === null || typeof result.body.text !== "string") {
+        var message = (result.body && result.body.error) ?
+          String(result.body.error) : "The server reported an unexpected problem.";
+        showCopyNotice("Not copied: " + message);
+        return;
+      }
+      navigator.clipboard.writeText(result.body.text).then(function () {
+        showCopyNotice("Copied the whole " + side + " file");
+      }, function () {
+        showCopyNotice("Not copied: the browser refused");
+      });
+    }).catch(function () {
+      showCopyNotice("Not copied: the server did not answer");
+    });
+  });
+  return button;
+}
+
 function renderDiffSticky() {
   clearNode(diffStickyElement);
   if (!hasSelection() || currentDiff === null || diffErrorText !== null) {
@@ -4575,6 +4629,14 @@ function renderDiffSticky() {
     miniHeader.appendChild(plainPath);
   }
   miniHeader.appendChild(makeCountsSpan(entry));
+  if (canCopyToClipboard() && !entry.binary && !isDirectoryEntry(entry)) {
+    if (entry.status !== "A") {
+      miniHeader.appendChild(makeCopyFileButton(entry.path, "old"));
+    }
+    if (entry.status !== "D") {
+      miniHeader.appendChild(makeCopyFileButton(entry.path, "new"));
+    }
+  }
   diffStickyElement.appendChild(miniHeader);
 
   if (currentFile && currentFile.truncated) {

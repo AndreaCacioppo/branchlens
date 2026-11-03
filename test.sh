@@ -547,6 +547,64 @@ expect_get "$SERVER_PORT" "$FILE_RESP" "/api/file?branch=feature-committed&path=
 json_check "file binary: flagged binary with empty patch" "$FILE_RESP" \
   'data["binary"] is True and data["patch"] == ""'
 
+# ---------------------------------------------------------------- /api/file-text
+
+TEXT_RESP="$FIXTURE/file-text.json"
+
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?branch=feature-committed&path=alpha.txt&side=old" "200" "/api/file-text old side returns HTTP 200"
+json_check "file text: the old side is the whole file at the fork point" "$TEXT_RESP" \
+  'data["side"] == "old" and data["text"] == "line1\nline2\nline3\nline4\nline5\nline6\n"'
+
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?branch=feature-committed&path=alpha.txt&side=new" "200" "/api/file-text new side returns HTTP 200"
+json_check "file text: the new side is the whole file on the branch" "$TEXT_RESP" \
+  'data["text"] == "line1\nline2 CHANGED\nline3\nline4\nline5\nline6\nadded at end\n"'
+
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?branch=feature-committed&path=src/newname.py&side=old" "200" "/api/file-text old side of a rename returns HTTP 200"
+json_check "file text: a renamed file's old side is the file under its old name" "$TEXT_RESP" \
+  'data["text"] == "".join("keep%d\n" % n for n in range(1, 11))'
+
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?branch=feature-committed&path=src/newname.py&side=new" "200" "/api/file-text new side of a rename returns HTTP 200"
+json_check "file text: a renamed file's new side carries the edit" "$TEXT_RESP" \
+  'data["text"] == "".join("keep%d\n" % n for n in range(1, 11)) + "edit after rename\n"'
+
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?branch=feature-committed&path=docs/gone.txt&side=old" "200" "/api/file-text old side of a deleted file returns HTTP 200"
+json_check "file text: a deleted file's old side is its last content" "$TEXT_RESP" \
+  'data["text"] == "to be deleted\n"'
+
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?branch=feature-committed&path=docs/gone.txt&side=new" "400" "/api/file-text new side of a deleted file returns HTTP 400"
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?branch=feature-committed&path=src/brandnew.py&side=old" "400" "/api/file-text old side of an added file returns HTTP 400"
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?branch=feature-committed&path=docs/image.bin&side=new" "400" "/api/file-text binary file returns HTTP 400"
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?branch=feature-committed&path=alpha.txt&side=both" "400" "/api/file-text with a bad side returns HTTP 400"
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?branch=feature-committed&path=../../etc/hosts&side=new" "404" "/api/file-text path traversal returns HTTP 404"
+
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?branch=feature-worktree&path=alpha.txt&side=new" "200" "/api/file-text worktree file returns HTTP 200"
+json_check "file text: a checked-out branch's new side includes the uncommitted edit" "$TEXT_RESP" \
+  'data["text"] == "line1\nline2\nline3\nline4\nline5\nline6\nUNCOMMITTED EDIT\n"'
+
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?branch=feature-worktree&path=scratch.txt&side=new" "200" "/api/file-text untracked file returns HTTP 200"
+json_check "file text: an untracked file's new side is the file on disk" "$TEXT_RESP" \
+  'data["text"] == "untracked line 1\nuntracked line 2\nuntracked line 3\n"'
+
+# Reading a side back from a patch: a missing final newline belongs to the
+# side of the line before the marker, and a context line to both sides.
+python3 -c '
+import sys
+from branchlens import gitops
+patch = (
+    "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,3 @@\n"
+    " keep\n-@@ old\n\\ No newline at end of file\n+-- new\n+last\n"
+    "\\ No newline at end of file\n"
+)
+ok = (
+    gitops.patch_side_text(patch, "old") == "keep\n@@ old"
+    and gitops.patch_side_text(patch, "new") == "keep\n-- new\nlast"
+    and gitops.patch_side_text("@@ -1 +1 @@\n same\n\\ No newline at end of file\n", "new") == "same"
+    and gitops.patch_side_text("", "old") == ""
+)
+sys.exit(0 if ok else 1)
+'
+check "file text: patch_side_text keeps content lines that look like headers and honours missing final newlines" $?
+
 # ---------------------------------------------------------------- error cases
 
 ERR="$FIXTURE/error.json"
@@ -752,6 +810,13 @@ json_check "diff root: a body-less commit message is the subject with no trailin
 expect_get "$SERVER_PORT" "$FILE_RESP" "/api/file?commit=$NORMAL_SHA&path=mainonly.txt" "200" "/api/file for a commit returns HTTP 200"
 json_check "file commit: patch shows the line that commit added" "$FILE_RESP" \
   'data["status"] == "M" and "+more main work" in data["patch"] and "@@" in data["patch"]'
+
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?commit=$NORMAL_SHA&path=mainonly.txt&side=old" "200" "/api/file-text for a commit returns HTTP 200"
+json_check "file text commit: the old side is the file at the commit's parent" "$TEXT_RESP" \
+  'data["text"] == "main only file\n"'
+expect_get "$SERVER_PORT" "$TEXT_RESP" "/api/file-text?commit=$NORMAL_SHA&path=mainonly.txt&side=new" "200" "/api/file-text new side for a commit returns HTTP 200"
+json_check "file text commit: the new side is the file at the commit" "$TEXT_RESP" \
+  'data["text"] == "main only file\nmore main work\n"'
 
 # ---------------------------------------------------------------- commit id validation
 
