@@ -3007,6 +3007,28 @@ def get_file_text(repo_root, side, path, branch=None, commit_sha=None, base_sha=
     }
 
 
+def get_file_sides(repo_root, path, branch=None, commit_sha=None, base_sha=None):
+    """The whole file before and after the change, for finding its comments.
+
+    Returns (old_text, new_text), read back from the file's full-context
+    patch like get_file_text. A side the file does not have, such as the old
+    side of an added file, is "", and so are both sides of a binary file.
+    Returns None when the file is too large for the patch limit.
+    """
+    if branch is not None:
+        file_patch = get_file_patch(repo_root, branch, path, base_sha, full_context=True)
+    else:
+        file_patch = get_commit_file_patch(
+            repo_root, commit_sha, path, base_sha, full_context=True
+        )
+    if file_patch["truncated"]:
+        return None
+    return (
+        patch_side_text(file_patch["patch"], "old"),
+        patch_side_text(file_patch["patch"], "new"),
+    )
+
+
 def patch_side_text(patch_text, side):
     """One side of the file a full-context patch shows.
 

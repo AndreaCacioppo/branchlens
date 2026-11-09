@@ -24,6 +24,9 @@
   --del-fg: #cf222e;
   --gutter: #fafaf8;
   --flash: #fff8c5;
+  /* the comments toggle: a comment's mark, and the code around it */
+  --comment-bg: #fff1a6;
+  --faded-code: #9aa3ad;
   --amber-banner-bg: #fff8c5;
   --amber-banner-fg: #7d4e00;
   --amber-dot: #9a6700;
@@ -70,6 +73,8 @@
     --del-fg: #f85149;
     --gutter: #14181f;
     --flash: #272215;
+    --comment-bg: #4b3c00;
+    --faded-code: #5c646e;
     --amber-banner-bg: #272215;
     --amber-banner-fg: #d29922;
     --amber-dot: #d29922;
@@ -1500,6 +1505,25 @@ body {
   color: var(--add-fg);
 }
 .copy-file:hover { text-decoration: underline; }
+/* the comments toggle: when on, it marks the comments and fades the rest */
+.comments-toggle {
+  flex: none;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--canvas);
+  color: var(--muted);
+  cursor: pointer;
+}
+.comments-toggle[aria-pressed="true"] {
+  border-color: var(--amber-dot);
+  background: var(--comment-bg);
+  color: var(--text);
+}
+.comments-toggle:hover { text-decoration: underline; }
 .banner {
   padding: 6px 12px;
   font-size: 12px;
@@ -1555,6 +1579,13 @@ tr.row-del td.code   { background: var(--del-line-bg); }
 tr.row-del td.gutter { background: var(--del-gutter-bg); }
 /* the muted colour is too faint on the coloured gutters */
 tr.row-add td.gutter, tr.row-del td.gutter { color: var(--text); }
+/* comments toggle on: the code fades, its comments keep the text colour */
+.diff-chunks.comments-mode td.code { color: var(--faded-code); }
+mark.comment {
+  color: var(--text);
+  background: var(--comment-bg);
+  border-radius: 2px;
+}
 /* the line a Check-tab finding points at */
 tr.jump-target td {
   box-shadow: inset 0 1px 0 var(--accent), inset 0 -1px 0 var(--accent);
@@ -2020,6 +2051,8 @@ td.sep {
   .uncommitted-dot { forced-color-adjust: none; background: Mark; }
   #live-dot { forced-color-adjust: none; background: Highlight; }
   #live-dot.off { background: GrayText; }
+  mark.comment { forced-color-adjust: none; background: Mark; color: MarkText; }
+  .comments-toggle[aria-pressed="true"] { border-color: Highlight; }
 }
 
 /* Printing: the whole diff on paper, without the sidebar and the lists */
@@ -2153,6 +2186,7 @@ var fileErrorText = null;
 var fileVanished = false;
 var fileReloadDeferred = false;   // the open file changed while the Network view hid it
 var fileToRestore = null;         // file named in the address, opened once its diff loads
+var commentsMode = false;         // the comments toggle; it stays on from file to file
 var restoringCommit = false;      // the commit is the one named in the address, not yet answered
 
 // One serial per loader, bumped when a request is issued: only the newest
@@ -4532,6 +4566,42 @@ function patchModeNote(modes) {
   return null;
 }
 
+// One line's text cut around its comments, for the comments toggle, as
+// [{text, comment}] where comment is true inside a range. ranges is the
+// server's [[start, end], ...] for the line, in order; a range reaching
+// past the text is cut short, and an empty one dropped.
+function commentPieces(text, ranges) {
+  var pieces = [];
+  var position = 0;
+  for (var i = 0; i < ranges.length; i++) {
+    var start = Math.max(ranges[i][0], position);
+    var end = Math.min(ranges[i][1], text.length);
+    if (end <= start) {
+      continue;
+    }
+    if (start > position) {
+      pieces.push({ text: text.slice(position, start), comment: false });
+    }
+    pieces.push({ text: text.slice(start, end), comment: true });
+    position = end;
+  }
+  if (position < text.length) {
+    pieces.push({ text: text.slice(position), comment: false });
+  }
+  return pieces;
+}
+
+// The comment ranges the server found for one diff row, or null. A deleted
+// line is looked up by its old number, any other line by its new number.
+function commentRangesForRow(row, comments) {
+  var side = row.type === "del" ? comments.old : comments["new"];
+  var number = row.type === "del" ? row.oldNumber : row.newNumber;
+  if (!Object.prototype.hasOwnProperty.call(side, number)) {
+    return null;
+  }
+  return side[number];
+}
+
 /* PARSER-EXTRACT-END */
 
 /* ============================== Diff pane ================================= */
@@ -4599,7 +4669,77 @@ function makeCopyFileButton(path, side) {
   return button;
 }
 
+// Marks the comments in the open file and fades the rest of the code. The
+// choice stays on while other files are opened, and the address keeps it.
+function makeCommentsToggle() {
+  var button = makeText("button", "comments-toggle", "comments");
+  button.type = "button";
+  button.setAttribute("aria-pressed", commentsMode ? "true" : "false");
+  if (commentsMode) {
+    button.title = "Show the code as usual";
+  } else {
+    button.title = "Mark the comments and fade the rest of the code, " +
+      "in this file and the next ones you open";
+  }
+  button.addEventListener("click", function () {
+    commentsMode = !commentsMode;
+    rememberViewInAddress();
+    button.focus(); // renderDiffSticky moves the focus to the button it draws next
+    preserveScroll(document.getElementById("diff-pane"), renderDiffPane);
+    refreshOpenFile(); // the next answer carries the comments, or stops carrying them
+  });
+  return button;
+}
+
+// The comments the server found in the open file while the toggle is on,
+// or null: the toggle is off, the answer is not in yet, or BranchLens does
+// not know the file's language.
+function shownComments() {
+  if (!commentsMode || currentFile === null || !currentFile.comments ||
+      currentFile.comments.language === null) {
+    return null;
+  }
+  return currentFile.comments;
+}
+
+// The line under the header while the comments toggle is on.
+function commentsBannerText() {
+  if (!currentFile.comments) {
+    return "Looking for comments…";
+  }
+  if (currentFile.comments.note) {
+    return currentFile.comments.note;
+  }
+  var rows = buildDiffRows(parseUnifiedDiff(currentFile.patch || ""));
+  var changed = 0;
+  for (var i = 0; i < rows.length; i++) {
+    if ((rows[i].type === "add" || rows[i].type === "del") &&
+        commentRangesForRow(rows[i], currentFile.comments) !== null) {
+      changed += 1;
+    }
+  }
+  var sentence = currentFile.comments.language +
+    " comments are marked and the rest of the code is faded. ";
+  if (changed === 0) {
+    return sentence + "No added or deleted line holds a comment.";
+  }
+  if (changed === 1) {
+    return sentence + "1 added or deleted line holds a comment.";
+  }
+  return sentence + changed + " added or deleted lines hold a comment.";
+}
+
 function renderDiffSticky() {
+  var toggleHadFocus = document.activeElement !== null &&
+    document.activeElement.classList.contains("comments-toggle");
+  drawDiffSticky();
+  var toggle = diffStickyElement.querySelector(".comments-toggle");
+  if (toggleHadFocus && toggle !== null) {
+    toggle.focus(); // the header is drawn anew: the focus stays on the toggle
+  }
+}
+
+function drawDiffSticky() {
   clearNode(diffStickyElement);
   if (!hasSelection() || currentDiff === null || diffErrorText !== null) {
     return;
@@ -4629,6 +4769,9 @@ function renderDiffSticky() {
     miniHeader.appendChild(plainPath);
   }
   miniHeader.appendChild(makeCountsSpan(entry));
+  if (!entry.binary && !isDirectoryEntry(entry)) {
+    miniHeader.appendChild(makeCommentsToggle());
+  }
   if (canCopyToClipboard() && !entry.binary && !isDirectoryEntry(entry)) {
     if (entry.status !== "A") {
       miniHeader.appendChild(makeCopyFileButton(entry.path, "old"));
@@ -4642,6 +4785,9 @@ function renderDiffSticky() {
   if (currentFile && currentFile.truncated) {
     diffStickyElement.appendChild(
       makeText("div", "banner amber", "Large change: showing only the first part."));
+  }
+  if (commentsMode && currentFile && !currentFile.binary && !isDirectoryEntry(currentFile)) {
+    diffStickyElement.appendChild(makeText("div", "banner", commentsBannerText()));
   }
   // an executable bit, a symbolic link or a submodule: the lines alone hide it
   var modeNote = currentFile ? patchModeNote(parsePatchModes(currentFile.patch || "")) : null;
@@ -4761,8 +4907,26 @@ function makeDiffRowElement(rowData) {
   var row = makeElement("tr", "row-" + rowData.type);
   row.appendChild(makeText("td", "gutter mono", rowData.oldNumber));
   row.appendChild(makeText("td", "gutter mono", rowData.newNumber));
-  row.appendChild(makeText("td", "code mono", rowData.text));
+  row.appendChild(makeCodeCell(rowData));
   return row;
+}
+
+// The code cell of a row. With the comments toggle on, each comment sits in
+// a <mark>; copying still reads the cell's plain text.
+function makeCodeCell(rowData) {
+  if (!rowData.comments) {
+    return makeText("td", "code mono", rowData.text);
+  }
+  var cell = makeElement("td", "code mono");
+  var pieces = commentPieces(rowData.text, rowData.comments);
+  for (var i = 0; i < pieces.length; i++) {
+    if (pieces[i].comment) {
+      cell.appendChild(makeText("mark", "comment", pieces[i].text));
+    } else {
+      cell.appendChild(document.createTextNode(pieces[i].text));
+    }
+  }
+  return cell;
 }
 
 // One chunk: a table with the same fixed columns as every other chunk.
@@ -4792,7 +4956,20 @@ function makeDiffChunk(rows, heightPx) {
 // Shows the file's table, keeping every chunk already on screen whose rows
 // did not change.
 function showDiffTable(hunks) {
-  var chunks = splitDiffRows(buildDiffRows(hunks));
+  var rows = buildDiffRows(hunks);
+  var comments = shownComments();
+  if (comments !== null) {
+    // the ranges become part of the rows, so a chunk whose marks change is rebuilt
+    for (var r = 0; r < rows.length; r++) {
+      if (rows[r].type !== "sep") {
+        var ranges = commentRangesForRow(rows[r], comments);
+        if (ranges !== null) {
+          rows[r].comments = ranges;
+        }
+      }
+    }
+  }
+  var chunks = splitDiffRows(rows);
   var keys = [];
   for (var i = 0; i < chunks.length; i++) {
     keys.push(JSON.stringify(chunks[i]));
@@ -4830,6 +5007,7 @@ function showDiffTable(hunks) {
     diffChunkHolder.removeChild(diffChunkHolder.lastChild);
   }
   diffChunkKeys = keys;
+  diffChunkHolder.classList.toggle("comments-mode", comments !== null);
 }
 
 // Replaces whatever the diff body shows with one element (null: nothing).
@@ -5392,6 +5570,9 @@ function loadFile() {
   fileReloadWanted = false; // this request covers it
   var url = "/api/file?" + targetQuery(branchName, commitSha, requestBase) +
             "&path=" + encodeURIComponent(path);
+  if (commentsMode) {
+    url = url + "&comments=1"; // the answer then says where the comments are
+  }
   fetchJson(url).then(function (result) {
     if (serial !== fileRequestSerial) {
       return; // a newer request was issued meanwhile
@@ -11623,6 +11804,9 @@ function rememberViewInAddress() {
   if (baseSha !== null) {
     parts.push("base=" + encodeURIComponent(baseSha));
   }
+  if (commentsMode) {
+    parts.push("comments=on");
+  }
   try {
     history.replaceState(null, "", "#" + parts.join("&"));
   } catch (error) {
@@ -11631,7 +11815,7 @@ function rememberViewInAddress() {
 }
 
 function readViewFromAddress() {
-  var saved = { view: null, branch: null, commit: null, file: null, base: null };
+  var saved = { view: null, branch: null, commit: null, file: null, base: null, comments: null };
   var pairs = window.location.hash.replace(/^#/, "").split("&");
   for (var i = 0; i < pairs.length; i++) {
     var equalsAt = pairs[i].indexOf("=");
@@ -11654,6 +11838,7 @@ function readViewFromAddress() {
 
 // Read before anything rewrites the address; used once.
 var savedAddressView = readViewFromAddress();
+commentsMode = savedAddressView.comments === "on"; // before the first file loads
 
 // With the first /api/state answer: back to the view in the address, as
 // far as it still exists, then its commit, else a branch (the saved one,

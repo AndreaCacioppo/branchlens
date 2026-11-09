@@ -605,6 +605,123 @@ sys.exit(0 if ok else 1)
 '
 check "file text: patch_side_text keeps content lines that look like headers and honours missing final newlines" $?
 
+# ---------------------------------------------------------------- /api/file?comments=1
+# The comments toggle: the answer also says where the comments are on the
+# lines the patch shows.
+
+COMMENTS_RESP="$FIXTURE/file-comments.json"
+
+expect_get "$SERVER_PORT" "$COMMENTS_RESP" "/api/file?branch=feature-committed&path=src/newname.py&comments=1" "200" "/api/file with comments=1 returns HTTP 200"
+json_check "file comments: a .py file is read as Python, and lines without comments get no ranges" "$COMMENTS_RESP" \
+  'data["comments"] == {"language": "Python", "note": None, "old": {}, "new": {}} and "edit after rename" in data["patch"]'
+
+expect_get "$SERVER_PORT" "$COMMENTS_RESP" "/api/file?branch=feature-committed&path=alpha.txt&comments=1" "200" "/api/file with comments=1 on a .txt file returns HTTP 200"
+json_check "file comments: a kind of file BranchLens does not know gets a note instead of ranges, and its patch as usual" "$COMMENTS_RESP" \
+  'data["comments"]["language"] is None and "does not know" in data["comments"]["note"] and "+line2 CHANGED" in data["patch"]'
+
+expect_get "$SERVER_PORT" "$COMMENTS_RESP" "/api/file?branch=feature-committed&path=alpha.txt" "200" "/api/file without comments=1 returns HTTP 200"
+json_check "file comments: without comments=1 the answer has no comments" "$COMMENTS_RESP" \
+  '"comments" not in data'
+
+# The scan itself: a marker inside a string, a URL or a regex is no comment,
+# and a docstring is one only when it stands alone as a statement.
+python3 - <<'PY'
+import sys
+
+from branchlens import comments
+
+problems = []
+
+
+def expect(path, text, wanted):
+    language = comments.language_for(path, text.split("\n")[0])
+    found = [text[start:end] for start, end in comments.find_comment_spans(text, language)]
+    if found != wanted:
+        problems.append(path + ": " + repr(found))
+
+
+expect("a.py", (
+    '"""Module doc."""\n'
+    'x = "not # a comment"  # real\n'
+    'def f(a=(1, 2)):\n'
+    '    """Doc\n    on two lines."""\n'
+    '    y = """not a docstring"""\n'
+    '    call(\n        """an argument"""\n    )\n'
+    '    s = """{}""".format(1)\n'
+    "    return r'#' + '\\'' # tail\n"
+), ['"""Module doc."""', "# real", '"""Doc\n    on two lines."""', "# tail"])
+expect("a.js", (
+    'const url = "http://x.org"; // after a URL\n'
+    "const re = /[\"'\\/]+/g; // after a regex\n"
+    "const d = a / b; /* a block\nover two lines */ const t = `// in a template`;\n"
+), ["// after a URL", "// after a regex", "/* a block\nover two lines */"])
+expect("run.sh", "echo ${#list} a#b # yes\n# whole line\necho '#no' \"#no\"\n", ["# yes", "# whole line"])
+expect("lib.rs", "fn f<'a>(x: &'a str) -> char { let c = '\"'; // c\n c }\n", ["// c"])
+expect("page.html", (
+    "<!-- top -->\n<p>http://x.org</p>\n<script>\n// js\nvar a = \"<!-- no -->\";\n</script>\n"
+    "<style>/* css */ a {}</style>\n"
+), ["<!-- top -->", "// js", "/* css */"])
+expect("query.sql", "SELECT '--no' -- yes\n/* b */ FROM t # mysql\n", ["-- yes", "/* b */", "# mysql"])
+expect("conf.yaml", "url: http://x.org#frag # yes\n", ["# yes"])
+expect("tool.pl", "my $n = $#list; # yes\n=pod\ndoc\n=cut\nprint 1;\n", ["# yes", "=pod\ndoc\n=cut"])
+expect("main.go", "s := `raw // no\nstill`; // yes\nr := '\\''\n", ["// yes"])
+expect("tool", "#!/usr/bin/env -S python3.12 -u\nx = 1  # py\n", ["#!/usr/bin/env -S python3.12 -u", "# py"])
+if comments.language_for("notes.txt", "") is not None:
+    problems.append("notes.txt has a language")
+if comments.language_for("Dockerfile.dev", "")["name"] != "Dockerfile":
+    problems.append("Dockerfile.dev is not a Dockerfile")
+
+# Ranges count UTF-16 units, as the page does: the emoji counts two.
+patch = (
+    "--- a/a.py\n+++ b/a.py\n@@ -1,3 +1,3 @@\n x = 1\n"
+    "-y = 2  # old\n+y = 3  # new \U0001F600 \u00e9\n z\n"
+)
+answer = comments.find_patch_comments(
+    "a.py", patch, ("x = 1\ny = 2  # old\nz\n", "x = 1\ny = 3  # new \U0001F600 \u00e9\nz\n")
+)
+if answer != {"language": "Python", "note": None, "old": {"2": [[7, 12]]}, "new": {"2": [[7, 17]]}}:
+    problems.append("ranges: " + repr(answer))
+# A file that changed between the two reads gets no ranges on that line.
+stale = comments.find_patch_comments("a.py", patch, ("x = 1\ny = 2  # old\nz\n", "x = 1\ny = 4  # other\nz\n"))
+if stale["new"] != {}:
+    problems.append("stale: " + repr(stale))
+if "too large" not in comments.find_patch_comments("a.py", patch, None)["note"]:
+    problems.append("no note for a file too large")
+
+if problems:
+    print("\n".join(problems), file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+PY
+check "file comments: strings, URLs and regexes hide no comment, docstrings count only as statements, ranges count UTF-16 units" $?
+
+# A docstring that opens above the hunk: the patch alone cannot tell that
+# its lines are a comment, the whole file can.
+COMMENTS_REPO="$FIXTURE/comments-repo"
+new_repo "$COMMENTS_REPO"
+printf '%s\n' 'def area(width, height):' '    """Return the area.' '' '    One.' '    Two.' \
+  '    Three.' '    Four.' '    Old wording."""' '    return width * height  # plain' \
+  > "$COMMENTS_REPO/shapes.py"
+git -C "$COMMENTS_REPO" add -A
+git -C "$COMMENTS_REPO" commit -q -m "Add shapes"
+printf '%s\n' 'def area(width, height):' '    """Return the area.' '' '    One.' '    Two.' \
+  '    Three.' '    Four.' '    New wording."""' '    return width * height  # 📐 area' \
+  > "$COMMENTS_REPO/shapes.py"
+git -C "$COMMENTS_REPO" commit -q -a -m "Reword shapes"
+COMMENTS_SHA=$(git -C "$COMMENTS_REPO" rev-parse HEAD)
+
+LOG_COMMENTS="$FIXTURE/server-comments.log"
+python3 -m branchlens "$COMMENTS_REPO" --port 0 --no-browser > "$LOG_COMMENTS" 2>&1 &
+echo "$!" >> "$FIXTURE/extra-pids"
+SERVER_PORT_COMMENTS=$(wait_for_server "$LOG_COMMENTS")
+check "file comments: server starts on the comments repository" $?
+
+if [ -n "$SERVER_PORT_COMMENTS" ]; then
+  expect_get "$SERVER_PORT_COMMENTS" "$COMMENTS_RESP" "/api/file?commit=$COMMENTS_SHA&path=shapes.py&comments=1" "200" "/api/file with comments=1 for a commit returns HTTP 200"
+  json_check "file comments: a docstring opened above the hunk marks its lines past their indentation; a trailing comment is cut exactly" "$COMMENTS_RESP" \
+    'data["patch"].count("@@ -5,5 +5,5 @@") == 1 and data["comments"]["new"] == {"5": [[4, 8]], "6": [[4, 10]], "7": [[4, 9]], "8": [[4, 19]], "9": [[27, 36]]} and data["comments"]["old"] == {"8": [[4, 19]], "9": [[27, 34]]}'
+fi
+
 # ---------------------------------------------------------------- error cases
 
 ERR="$FIXTURE/error.json"
@@ -9616,7 +9733,7 @@ end = text.index("/* PARSER-EXTRACT-END */")
 for name in ("function parseUnifiedDiff(", "function parsePatchModes(", "function patchModeNote("):
     if not start < text.index(name) < end:
         sys.exit(1)
-if "patchModeNote(parsePatchModes(currentFile.patch" not in function_body("renderDiffSticky"):
+if "patchModeNote(parsePatchModes(currentFile.patch" not in function_body("drawDiffSticky"):
     sys.exit(1)
 body = function_body("renderDiffBody")
 if '"The contents did not change. "' not in body or "patchModeNote(parsePatchModes(" not in body:
@@ -9706,12 +9823,62 @@ assert.deepStrictEqual(cutHunks[0].lines[2], { type: "add", text: "new li" });
 var cutHeader = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n@@ -10,4 +1";
 assert.strictEqual(parseUnifiedDiff(cutHeader).length, 1);
 assert.strictEqual(noteOf("diff --git a/x b/x\nnew file mo"), null);
+// the comments toggle: a line cut around its comment ranges
+assert.deepStrictEqual(commentPieces("x = 1  # note", [[7, 13]]),
+  [{ text: "x = 1  ", comment: false }, { text: "# note", comment: true }]);
+assert.deepStrictEqual(commentPieces("/* a */ b /* c */", [[0, 7], [10, 17]]),
+  [{ text: "/* a */", comment: true }, { text: " b ", comment: false },
+   { text: "/* c */", comment: true }]);
+// a range past the end is cut short, one outside the text dropped
+assert.deepStrictEqual(commentPieces("ab", [[1, 9], [5, 6]]),
+  [{ text: "a", comment: false }, { text: "b", comment: true }]);
+assert.deepStrictEqual(commentPieces("", [[0, 3]]), []);
+// a deleted line by its old number, any other line by its new number
+var foundComments = { old: { "4": [[0, 3]] }, "new": { "5": [[1, 2]] } };
+assert.deepStrictEqual(commentRangesForRow({ type: "del", oldNumber: "4", newNumber: "" },
+  foundComments), [[0, 3]]);
+assert.deepStrictEqual(commentRangesForRow({ type: "ctx", oldNumber: "4", newNumber: "5" },
+  foundComments), [[1, 2]]);
+assert.strictEqual(commentRangesForRow({ type: "add", oldNumber: "", newNumber: "4" },
+  foundComments), null);
+assert.strictEqual(commentRangesForRow({ type: "add", oldNumber: "", newNumber: "toString" },
+  foundComments), null);
 JS
   node "$PARSER_HELPERS"
-  check "page audit: parsePatchModes and patchModeNote read mode-only, type, symlink and submodule patches (run in node)" $?
+  check "page audit: parsePatchModes and patchModeNote read mode-only, type, symlink and submodule patches; commentPieces cuts a line around its comments (run in node)" $?
 else
   echo "SKIP: node is not installed, so the extracted parser helpers were not run"
 fi
+
+python3 - "$SOURCE_DIR/static/app.html" <<'PY'
+import sys
+
+from pagesource import text, function_body
+load = function_body("loadFile")
+if "if (commentsMode) {" not in load or 'url = url + "&comments=1";' not in load:
+    sys.exit(1)
+if "makeCommentsToggle()" not in function_body("drawDiffSticky"):
+    sys.exit(1)
+if "commentsBannerText()" not in function_body("drawDiffSticky"):
+    sys.exit(1)
+# the header is drawn anew on every change: a focused toggle keeps the focus
+sticky = function_body("renderDiffSticky")
+if "drawDiffSticky();" not in sticky or "toggle.focus();" not in sticky:
+    sys.exit(1)
+if "makeCodeCell(rowData)" not in function_body("makeDiffRowElement"):
+    sys.exit(1)
+if 'classList.toggle("comments-mode", comments !== null)' not in function_body("showDiffTable"):
+    sys.exit(1)
+if 'parts.push("comments=on");' not in function_body("rememberViewInAddress"):
+    sys.exit(1)
+if 'commentsMode = savedAddressView.comments === "on";' not in text:
+    sys.exit(1)
+toggle = function_body("makeCommentsToggle")
+if 'setAttribute("aria-pressed"' not in toggle or "refreshOpenFile();" not in toggle:
+    sys.exit(1)
+sys.exit(0)
+PY
+check "page: the comments toggle asks for comments=1, marks them in the rows, keeps the focus, and the address keeps it on" $?
 
 python3 - "$SOURCE_DIR/static/app.html" <<'PY'
 import sys

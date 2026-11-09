@@ -239,6 +239,11 @@ class BranchLensHandler(BaseHTTPRequestHandler):
                     file_patch = gitops.get_commit_file_patch(
                         self.repo_root, commit, file_path, base
                     )
+                if self.read_param(params, "comments") == "1":
+                    # The page's comments toggle is on.
+                    file_patch["comments"] = self.find_file_comments(
+                        branch, commit, base, file_path, file_patch["patch"]
+                    )
                 self.send_json(200, file_patch)
             elif route == "/api/file-text":
                 # The whole file before or after the change, for the copy buttons.
@@ -376,6 +381,24 @@ class BranchLensHandler(BaseHTTPRequestHandler):
         if len(values) == 0 or values[0] == "":
             return None
         return values[0]
+
+    def find_file_comments(self, branch, commit, base, file_path, patch_text):
+        """Where the comments are on the lines of patch_text, for /api/file?comments=1.
+
+        A failure becomes a note in the answer; the file's patch is still sent.
+        """
+        from branchlens import comments, gitops
+
+        try:
+            file_sides = gitops.get_file_sides(self.repo_root, file_path, branch, commit, base)
+            return comments.find_patch_comments(file_path, patch_text, file_sides)
+        except Exception as error:
+            return {
+                "language": None,
+                "note": "BranchLens could not look for the comments: " + str(error),
+                "old": {},
+                "new": {},
+            }
 
     def check_target_params(self, branch, commit):
         """True when exactly one of branch= and commit= was given.

@@ -29,7 +29,9 @@ Python 3.9+ (standard library only), git 2.31+, macOS or Linux.
 Open the printed URL; each start prints a new access code. Branches lists
 every branch, with an amber dot on uncommitted edits. Tree draws the last 150
 commits. Network shows which files import which (Python, JavaScript,
-TypeScript, Java). Ctrl+C stops it.
+TypeScript, Java). The comments button in a file's header marks its
+comments and docstrings and fades the rest of the code; it stays on as you
+open other files. Ctrl+C stops it.
 
 ## Security check and Push
 
