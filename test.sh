@@ -311,7 +311,14 @@ new_repo() {
 
 # ---------------------------------------------------------------- fixture repo
 
-FIXTURE=$(mktemp -d)
+# Stop if no temporary folder could be made: an empty FIXTURE would turn
+# every path below into one at the root of the disk. `! VAR=$(command)` is
+# true when the command failed.
+if ! FIXTURE=$(mktemp -d) || [ -z "$FIXTURE" ] || [ ! -d "$FIXTURE" ]; then
+  echo "FAIL: mktemp -d could not make a temporary folder"
+  FIXTURE=""
+  exit 1
+fi
 # The app.html source checks share one module: the page's text and the
 # body of one of its functions. Each check passes the page as argv[1].
 # PYTHONPATH also lets every Python snippet below, and `python3 -m
@@ -10703,6 +10710,15 @@ grep -q "Report a vulnerability" "$PROJECT_DIR/README.md"
 check "the README names the private reporting route" $?
 grep -q "bash test.sh" "$PROJECT_DIR/README.md"
 check "the README says how to run the tests" $?
+# test.sh itself stops at once when mktemp -d fails, before any path is built.
+mkdir -p "$FIXTURE/failing-mktemp"
+printf '#!/bin/sh\nexit 1\n' > "$FIXTURE/failing-mktemp/mktemp"
+chmod +x "$FIXTURE/failing-mktemp/mktemp"
+NO_TEMP_OUTPUT=$(PATH="$FIXTURE/failing-mktemp:$PATH" bash "$PROJECT_DIR/test.sh" 2>&1)
+NO_TEMP_EXIT=$?
+[ "$NO_TEMP_EXIT" -eq 1 ] && \
+  [ "$NO_TEMP_OUTPUT" = "FAIL: mktemp -d could not make a temporary folder" ]
+check "test.sh stops when mktemp -d fails" $? "exit $NO_TEMP_EXIT: $(printf '%s' "$NO_TEMP_OUTPUT" | head -c 300)"
 DEMO_GIF="$PROJECT_DIR/docs/demo.gif"
 DEMO_GIF_BYTES=0
 DEMO_GIF_SIGNATURE=""
