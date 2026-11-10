@@ -328,6 +328,9 @@ def function_body(name):
     return text[start:text.index("\n}\n", start)]
 PY
 export PYTHONPATH="$PROJECT_DIR/src:$FIXTURE/pylib"
+# Every server writes a state file for `branchlens --status`; the suite's
+# go to the fixture, never to the user's ~/.branchlens.
+export BRANCHLENS_STATE_DIR="$FIXTURE/branchlens-state"
 REPO="$FIXTURE/repo"
 WORKTREE="$FIXTURE/wt"
 
@@ -8256,6 +8259,146 @@ process_ends "$(cat "$HUP_TOOLKIT/run.pid")" && process_ends "$(cat "$HUP_TOOLKI
 check "hangup: the run it started is stopped too" $?
 grep -q "Stopped the security check this server had started." "$HUP_LOG"
 check "hangup: the server says it stopped the run" $?
+
+# ---- the state file and --status ------------------------------------------------
+# A server writes $BRANCHLENS_STATE_DIR/<repository folder>-<hash>.json at
+# start and removes it when it stops. --status reads it and opens the URL in
+# it before it trusts it: a killed server leaves its file behind.
+
+STATUS_REPO="$FIXTURE/status-repo"
+new_repo "$STATUS_REPO"
+git -C "$STATUS_REPO" commit -q --allow-empty -m "Status fixture"
+git -C "$STATUS_REPO" worktree add -q -b status-side "$FIXTURE/status-wt"
+# The server names the repository by its physical path (symlinks resolved).
+STATUS_ROOT=$(cd "$STATUS_REPO" && pwd -P)
+STATUS_FILE=$(python3 -c 'import sys; from branchlens import server; print(server.state_file_path(sys.argv[1]))' "$STATUS_ROOT")
+STATUS_LOG="$FIXTURE/server-status.log"
+python3 -m branchlens "$STATUS_REPO" --port 0 --no-browser > "$STATUS_LOG" 2>&1 &
+STATUS_SERVER_PID=$!
+echo "$STATUS_SERVER_PID" >> "$FIXTURE/extra-pids"
+STATUS_PORT=$(wait_for_server "$STATUS_LOG")
+check "status: server starts" $?
+STATUS_URL=$(sed -n 's|^BranchLens serving status-repo at \(http://.*\)$|\1|p' "$STATUS_LOG" | head -n 1)
+
+python3 - "$STATUS_FILE" "$STATUS_SERVER_PID" "$STATUS_PORT" "$STATUS_URL" "$STATUS_ROOT" <<'PY'
+import json
+import os
+import re
+import stat
+import sys
+
+path, pid, port, url, root = sys.argv[1:6]
+with open(path, encoding="utf-8") as handle:
+    details = json.load(handle)
+launch_id = details.get("launch_id", "")
+expected = {"repo_root": root, "port": int(port), "pid": int(pid), "url": url,
+            "launch_id": launch_id}
+file_mode = stat.S_IMODE(os.stat(path).st_mode)
+folder_mode = stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode)
+ok = (details == expected and re.fullmatch(r"[0-9a-f]{16}", launch_id) is not None
+      and url != "" and file_mode == 0o600 and folder_mode == 0o700
+      and re.fullmatch(r"status-repo-[0-9a-f]{12}\.json", os.path.basename(path)) is not None)
+sys.exit(0 if ok else 1)
+PY
+check "status: the server writes its port, pid and URL to a state file only the owner can read" $?
+
+STATUS_OUT=$(python3 -m branchlens --status "$STATUS_REPO" 2>&1)
+STATUS_EXIT=$?
+[ "$STATUS_EXIT" -eq 0 ] && [ "$STATUS_OUT" = "BranchLens serving status-repo at $STATUS_URL" ]
+check "status: --status prints the running server's URL and exits 0" $? "exit $STATUS_EXIT: $STATUS_OUT"
+STATUS_OUT=$(cd "$FIXTURE/status-wt" && "$PROJECT_DIR/branchlens" --status 2>&1)
+STATUS_EXIT=$?
+[ "$STATUS_EXIT" -eq 0 ] && [ "$STATUS_OUT" = "BranchLens serving status-repo at $STATUS_URL" ]
+check "status: the launcher's --status, run in a linked worktree, finds the same server" $? "exit $STATUS_EXIT: $STATUS_OUT"
+STATUS_OUT=$(python3 -m branchlens --status "$FIXTURE/pylib" 2>&1)
+STATUS_EXIT=$?
+[ "$STATUS_EXIT" -eq 2 ] && printf '%s\n' "$STATUS_OUT" | grep -q "is not inside a git repository"
+check "status: --status outside a git repository says so and exits 2" $? "exit $STATUS_EXIT: $STATUS_OUT"
+python3 -m branchlens --help | grep -q -- "--status"
+check "status: --help lists --status" $?
+
+# --status must exit 1 and say that no server runs. $1: the check's description.
+status_says_not_running() {
+  local output
+  local exit_code
+  output=$(python3 -m branchlens --status "$STATUS_REPO" 2>&1)
+  exit_code=$?
+  [ "$exit_code" -eq 1 ] && [ "$output" = "BranchLens is not running for status-repo." ]
+  check "$1" $? "exit $exit_code: $output"
+}
+# Put the saved state file back with one key changed. $1: the key, $2: its
+# new value as JSON.
+rewrite_status_file() {
+  python3 - "$FIXTURE/status-good.json" "$STATUS_FILE" "$1" "$2" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    details = json.load(handle)
+details[sys.argv[3]] = json.loads(sys.argv[4])
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(details, handle)
+PY
+}
+cp "$STATUS_FILE" "$FIXTURE/status-good.json"
+# The launch code: what follows "token=" in the URL (## drops the longest
+# match of the pattern from the front).
+STATUS_CODE=${STATUS_URL##*token=}
+# A port nothing listens on: the OS hands out a free one, which is closed again.
+FREE_PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+WRONG_CODE=$(python3 -c 'print("0" * 64)')
+rewrite_status_file url "\"http://127.0.0.1:$STATUS_PORT/?token=$WRONG_CODE\""
+status_says_not_running "status: a state file whose code the server on that port does not know is not trusted"
+rewrite_status_file url "\"http://127.0.0.1:$FREE_PORT/?token=$STATUS_CODE\""
+status_says_not_running "status: a state file naming a port nothing listens on is not trusted"
+rewrite_status_file url "\"http://localhost:$STATUS_PORT/?token=$STATUS_CODE\""
+status_says_not_running "status: a URL not in the shape BranchLens prints is not trusted"
+rewrite_status_file repo_root '"/somewhere/else"'
+status_says_not_running "status: a state file for another repository is not trusted"
+printf 'not json\n' > "$STATUS_FILE"
+status_says_not_running "status: an unreadable state file means no server"
+cp "$FIXTURE/status-good.json" "$STATUS_FILE"
+STATUS_OUT=$(python3 -m branchlens --status "$STATUS_REPO" 2>&1)
+[ "$STATUS_OUT" = "BranchLens serving status-repo at $STATUS_URL" ]
+check "status: the restored state file finds the server again" $? "$STATUS_OUT"
+
+# A second server on the same repository takes the file over. The first
+# leaves it in place when it stops; the second removes it.
+STATUS_LOG2="$FIXTURE/server-status2.log"
+python3 -m branchlens "$FIXTURE/status-wt" --port 0 --no-browser > "$STATUS_LOG2" 2>&1 &
+STATUS_SERVER2_PID=$!
+echo "$STATUS_SERVER2_PID" >> "$FIXTURE/extra-pids"
+wait_for_server "$STATUS_LOG2" > /dev/null
+STATUS_URL2=$(sed -n 's|^BranchLens serving status-repo at \(http://.*\)$|\1|p' "$STATUS_LOG2" | head -n 1)
+STATUS_OUT=$(python3 -m branchlens --status "$STATUS_REPO" 2>&1)
+[ -n "$STATUS_URL2" ] && [ "$STATUS_URL2" != "$STATUS_URL" ] && \
+  [ "$STATUS_OUT" = "BranchLens serving status-repo at $STATUS_URL2" ]
+check "status: a second server on the same repository takes the state file over" $? "$STATUS_OUT"
+kill "$STATUS_SERVER_PID"
+process_ends "$STATUS_SERVER_PID" && [ -f "$STATUS_FILE" ] && \
+  [ "$(python3 -m branchlens --status "$STATUS_REPO" 2>&1)" = "BranchLens serving status-repo at $STATUS_URL2" ]
+check "status: the first server stops and leaves the second one's state file alone" $?
+kill "$STATUS_SERVER2_PID"
+process_ends "$STATUS_SERVER2_PID" && [ ! -e "$STATUS_FILE" ]
+check "status: a server removes its state file when it stops" $?
+status_says_not_running "status: with no server left, --status says so and exits 1"
+[ -z "$(ls -A "$(dirname "$STATUS_FILE")" | grep '\.tmp$')" ]
+check "status: no temporary state file is left behind" $?
+
+# A state folder that cannot be created costs only --status.
+STATUS_LOG3="$FIXTURE/server-status3.log"
+BRANCHLENS_STATE_DIR="$FIXTURE/pylib/pagesource.py/state" \
+  python3 -m branchlens "$STATUS_REPO" --port 0 --no-browser > "$STATUS_LOG3" 2>&1 &
+STATUS_SERVER3_PID=$!
+echo "$STATUS_SERVER3_PID" >> "$FIXTURE/extra-pids"
+STATUS_PORT3=$(wait_for_server "$STATUS_LOG3")
+expect_get "$STATUS_PORT3" "$RESPONSE" "/api/state" "200" \
+  "status: a server whose state folder cannot be created still serves"
+grep -q "warning: could not write the state file" "$STATUS_LOG3"
+check "status: ...and warns that --status will not find it" $?
+kill "$STATUS_SERVER3_PID"
+process_ends "$STATUS_SERVER3_PID"
+check "status: ...and stops cleanly" $?
 
 # ---- --no-push-host and the host a push really reaches (g135) --------------------
 
