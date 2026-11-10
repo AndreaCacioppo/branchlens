@@ -8400,6 +8400,103 @@ kill "$STATUS_SERVER3_PID"
 process_ends "$STATUS_SERVER3_PID"
 check "status: ...and stops cleanly" $?
 
+# ---- --idle-exit ----------------------------------------------------------------
+
+python3 - <<'PY'
+import argparse
+import sys
+
+from branchlens import server
+
+for bad_value in ["0", "-1", "abc", "", "nan", "inf", "-inf"]:
+    try:
+        server.positive_minutes(bad_value)
+    except argparse.ArgumentTypeError:
+        continue
+    print("  accepted:", repr(bad_value))
+    sys.exit(1)
+sys.exit(0 if server.positive_minutes("120") == 120 and server.positive_minutes("0.5") == 0.5 else 1)
+PY
+check "idle exit: minutes must be a number above zero; fractions are allowed" $?
+python3 -m branchlens "$STATUS_REPO" --port 0 --no-browser --idle-exit 0 > "$FIXTURE/idle-refused.log" 2>&1
+IDLE_EXIT_CODE=$?
+[ "$IDLE_EXIT_CODE" -eq 2 ] && grep -q "argument --idle-exit" "$FIXTURE/idle-refused.log"
+check "idle exit: --idle-exit 0 is refused before the server starts" $? "exit $IDLE_EXIT_CODE"
+
+python3 - <<'PY'
+import sys
+import time
+
+from branchlens import server
+
+
+def always_active():
+    return True
+
+
+httpd = server.create_server(0)
+try:
+    httpd.idle_exit_seconds = 1
+    # A running check: no stop, and the idle time starts again.
+    httpd.last_request_time = time.monotonic() - 5
+    server.RUNNER.is_active = always_active
+    try:
+        httpd.service_actions()
+    finally:
+        del server.RUNNER.is_active
+    kept_running = time.monotonic() - httpd.last_request_time < 1
+    # No check and nothing for 5 seconds: stop.
+    httpd.last_request_time = time.monotonic() - 5
+    try:
+        httpd.service_actions()
+        stopped = False
+    except server.IdleExit:
+        stopped = True
+    # Without --idle-exit nothing ever stops it.
+    httpd.idle_exit_seconds = None
+    httpd.last_request_time = 0.0
+    httpd.service_actions()
+finally:
+    httpd.server_close()
+sys.exit(0 if kept_running and stopped else 1)
+PY
+check "idle exit: a security check the server started counts as activity" $?
+
+IDLE_LOG="$FIXTURE/server-idle.log"
+python3 -m branchlens "$STATUS_REPO" --port 0 --no-browser --idle-exit 0.1 > "$IDLE_LOG" 2>&1 &
+IDLE_SERVER_PID=$!
+echo "$IDLE_SERVER_PID" >> "$FIXTURE/extra-pids"
+IDLE_PORT=$(wait_for_server "$IDLE_LOG")
+check "idle exit: server starts with --idle-exit 0.1 (6 seconds)" $?
+# One request a second for 8 seconds keeps it running.
+IDLE_ALIVE="yes"
+for idle_round in 1 2 3 4 5 6 7 8; do
+  sleep 1
+  STATUS=$(http_get "$IDLE_PORT" "$RESPONSE" "/api/state")
+  if [ "$STATUS" != "200" ]; then
+    IDLE_ALIVE="request $idle_round got HTTP $STATUS"
+  fi
+done
+[ "$IDLE_ALIVE" = "yes" ] && kill -0 "$IDLE_SERVER_PID" 2>/dev/null
+check "idle exit: requests keep the server running past its idle time" $? "$IDLE_ALIVE"
+IDLE_QUIET_FROM=$SECONDS
+# process_ends gives up after 5 seconds; this waits up to 20.
+idle_wait=0
+while kill -0 "$IDLE_SERVER_PID" 2>/dev/null && [ "$idle_wait" -lt 200 ]; do
+  sleep 0.1
+  idle_wait=$((idle_wait + 1))
+done
+IDLE_QUIET_SECONDS=$((SECONDS - IDLE_QUIET_FROM))
+! kill -0 "$IDLE_SERVER_PID" 2>/dev/null && [ "$IDLE_QUIET_SECONDS" -ge 4 ]
+check "idle exit: after 6 seconds with no request the server stops by itself" $? \
+  "stopped after about $IDLE_QUIET_SECONDS s"
+grep -qx "Stopped: no request for 0.1 minutes." "$IDLE_LOG"
+check "idle exit: ...says why" $?
+[ ! -e "$STATUS_FILE" ]
+check "idle exit: ...and removes its state file" $?
+python3 -m branchlens --help | grep -q -- "--idle-exit MINUTES"
+check "idle exit: --help lists --idle-exit" $?
+
 # ---- --no-push-host and the host a push really reaches (g135) --------------------
 
 SSH_SHIM="$FIXTURE/ssh-shim"

@@ -24,7 +24,7 @@ Python 3.9+ (standard library only), git 2.31+, macOS or Linux.
 
 ## Use
 
-    branchlens [path] [--port N] [--no-browser | --browser] [--check]
+    branchlens [path] [--port N] [--no-browser | --browser] [--check] [--idle-exit MINUTES]
     branchlens --status [path]
 
 Open the printed URL; each start prints a new access code. Branches lists
@@ -32,7 +32,8 @@ every branch, with an amber dot on uncommitted edits. Tree draws the last 150
 commits. Network shows which files import which (Python, JavaScript,
 TypeScript, Java). The comments button in a file's header marks its
 comments and docstrings and fades the rest of the code; it stays on as you
-open other files. Ctrl+C stops it.
+open other files. Ctrl+C stops it, and so does `--idle-exit MINUTES` after
+that long with no request; a security check it started counts as a request.
 
 `--status` starts nothing: it prints the URL of the server already running
 on that repository (exit 0), or says none is (exit 1). A running server

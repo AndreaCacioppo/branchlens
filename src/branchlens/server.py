@@ -1879,9 +1879,38 @@ def print_if_possible(text):
         pass
 
 
+class IdleExit(Exception):
+    """Raised inside serve_forever() when --idle-exit's time passed with no request."""
+
+
 class BranchLensServer(ThreadingHTTPServer):
     # Connections waiting to be accepted; the default of 5 resets a burst of more.
     request_queue_size = 64
+    # Seconds with no request after which the server stops (--idle-exit), or
+    # None to keep serving until it is stopped.
+    idle_exit_seconds = None
+    # time.monotonic() of the latest request; main() sets it at start too.
+    last_request_time = 0.0
+
+    def process_request(self, request, client_address):
+        # Every connection counts as activity for --idle-exit: the page's
+        # polling and `branchlens --status` included.
+        self.last_request_time = time.monotonic()
+        super().process_request(request, client_address)
+
+    def service_actions(self):
+        # serve_forever() calls this about twice a second. Raising here ends
+        # serve_forever(); main() catches IdleExit.
+        super().service_actions()
+        if self.idle_exit_seconds is None:
+            return
+        if RUNNER.is_active():
+            # Stopping the server would stop the check it started, so a
+            # running check counts as activity.
+            self.last_request_time = time.monotonic()
+            return
+        if time.monotonic() - self.last_request_time >= self.idle_exit_seconds:
+            raise IdleExit()
 
     def server_bind(self):
         # HTTPServer.server_bind also calls socket.getfqdn, a reverse DNS
@@ -1909,6 +1938,19 @@ def create_server(preferred_port):
             # OverflowError covers a --port value outside 0..65535.
             continue
     raise OSError("Could not find a free port to listen on.")
+
+
+def positive_minutes(text):
+    """argparse type of --idle-exit: a number of minutes above zero, fractions allowed."""
+    try:
+        minutes = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a number of minutes, got " + repr(text))
+    # float() also accepts "nan" and "inf"; neither passes this test.
+    if not 0 < minutes < float("inf"):
+        raise argparse.ArgumentTypeError("expected a number of minutes above zero, got "
+                                         + repr(text))
+    return minutes
 
 
 def opens_browser_by_default(platform):
@@ -1991,6 +2033,14 @@ def main():
              "comma-separated)",
     )
     parser.add_argument(
+        "--idle-exit",
+        type=positive_minutes,
+        default=None,
+        metavar="MINUTES",
+        help="stop after MINUTES with no request (default: never); a security "
+             "check this server started counts as activity",
+    )
+    parser.add_argument(
         "--status",
         action="store_true",
         help="start nothing: print the URL of the BranchLens already serving "
@@ -2064,6 +2114,9 @@ def main():
         pass
 
     server = create_server(args.port)
+    if args.idle_exit is not None:
+        server.idle_exit_seconds = args.idle_exit * 60
+    server.last_request_time = time.monotonic()
     # server_address holds the real port, needed when the OS picked one.
     actual_port = server.server_address[1]
     repo_name = Path(main_repo_root).name
@@ -2107,6 +2160,9 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         print_if_possible("Stopped.")
+    except IdleExit:
+        # "{:g}" prints 120.0 as 120 and keeps a fraction such as 0.5.
+        print_if_possible("Stopped: no request for {:g} minutes.".format(args.idle_exit))
     finally:
         if state_path is not None:
             remove_state_file(state_path, BranchLensHandler.launch_id)
