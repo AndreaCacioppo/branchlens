@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         # Ubuntu is pinned: "ubuntu-latest" became 26.04 in November 2026,
-        # which has no Python 3.9 build and where Semgrep does not run.
+        # which has no Python 3.9 build.
         os: [ubuntu-24.04, macos-latest]
         python-version: ["3.9", "3.x"]
         exclude:
@@ -45,8 +45,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.x"
-      - run: python -m pip install semgrep bandit pytest
+          # Python and Semgrep are pinned to the versions of the last green
+          # run (16 Oct 2026). With Python 3.15 and Semgrep 1.184 the Semgrep
+          # scan does not complete on Linux, and the gate reports NOT POSSIBLE.
+          python-version: "3.14"
+      - run: python -m pip install semgrep==1.181.0 bandit pytest
       - run: git --version && semgrep --version && node --version
       # The deep dives run only for skills installed in ~/.claude/skills.
       - run: make -C toolkit install-skills
