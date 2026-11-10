@@ -10,6 +10,7 @@ points are read through gitops.
 
 import json
 import os
+import pwd
 import re
 import signal
 import stat
@@ -39,6 +40,14 @@ MAX_QUOTED_TEXT_CHARS = 120
 SSH_LOOKUP_TIMEOUT_SECONDS = 3
 SSH_HOSTNAME_CACHE_SECONDS = 60
 MAX_SSH_HOSTNAME_CACHE_ENTRIES = 256
+# Names another ssh config file for ssh_config_unreadable() to try; test.sh
+# sets it so the suite does not depend on this machine's ~/.ssh.
+SSH_CONFIG_VARIABLE = "BRANCHLENS_SSH_CONFIG"
+# Why Push is off when ssh cannot read its config and some hosts are blocked.
+SSH_CONFIG_UNREADABLE_REASON = (
+    "BranchLens cannot read ssh's config file here, so it cannot tell which "
+    "host the ssh name {host} leads to, and Push is off for some hosts "
+    "(--no-push-host): push from a terminal if that host is allowed.")
 # Environment variables that tell git which repository, work tree, index or
 # object store to use. The push drops them: it runs in the branch's worktree.
 GIT_LOCATION_VARIABLES = (
@@ -401,6 +410,40 @@ def ssh_hostname(host):
     return resolved
 
 
+def ssh_config_path():
+    """This account's ssh config file: $BRANCHLENS_SSH_CONFIG, else ~/.ssh/config.
+
+    ssh takes the home folder from the account database, not from $HOME,
+    and so does this.
+    """
+    configured = os.environ.get(SSH_CONFIG_VARIABLE, "")
+    if configured != "":
+        return configured
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        home = os.path.expanduser("~")
+    return os.path.join(home, ".ssh", "config")
+
+
+def ssh_config_unreadable():
+    """True when this account's ssh config file exists but cannot be read.
+
+    ssh then skips the file without a word, and `ssh -G` hands every alias
+    back unchanged, as if it were a real host name. A sandbox that hides
+    ~/.ssh does this.
+    """
+    try:
+        with open(ssh_config_path(), "rb"):
+            pass
+    except (FileNotFoundError, NotADirectoryError):
+        # No config file: ssh has no alias to resolve.
+        return False
+    except OSError:
+        return True
+    return False
+
+
 def matching_blocked_suffix(host, blocked_host_suffixes):
     """The configured suffix this host falls under, or None.
 
@@ -460,7 +503,10 @@ def find_blocked_host(push_directory, remote_name, remote_urls, blocked_host_suf
 
     origin is checked even when the push goes to another remote. For a URL
     reached through ssh, the HostName ssh resolves the host to is checked
-    too, so an ssh alias for a blocked host counts as that host.
+    too, so an ssh alias for a blocked host counts as that host. When ssh
+    cannot read its config, its answer says nothing about an alias, so the
+    host as written is returned: the only answer that matches no blocked
+    suffix.
     """
     if len(blocked_host_suffixes) == 0:
         return None
@@ -475,6 +521,8 @@ def find_blocked_host(push_directory, remote_name, remote_urls, blocked_host_suf
             resolved = ssh_hostname(host)
             if matching_blocked_suffix(resolved, blocked_host_suffixes) is not None:
                 return resolved
+            if ssh_config_unreadable():
+                return host
     return None
 
 
@@ -829,7 +877,11 @@ def check_push(repo_root, reports_root, run_id, feed_running, feed_verdict_word,
         status["set_upstream"] = push_facts["set_upstream"]
         blocked_host = find_blocked_host(push_directory, remote_name,
                                          remote_urls, blocked_host_suffixes)
-        if blocked_host is not None:
+        if blocked_host is not None and \
+                matching_blocked_suffix(blocked_host, blocked_host_suffixes) is None:
+            # An ssh name find_blocked_host could not resolve.
+            remote_reason = SSH_CONFIG_UNREADABLE_REASON.format(host=blocked_host)
+        elif blocked_host is not None:
             remote_reason = ("Repositories on " + blocked_host + " are pushed "
                              "from another machine: port the change by hand.")
         elif upstream_branch is not None and upstream_branch != branch:

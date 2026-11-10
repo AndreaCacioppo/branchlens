@@ -8,7 +8,9 @@ setting the branch's upstream when it has none.
 
 import argparse
 import calendar
+import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
@@ -77,6 +79,14 @@ NO_PAGE_TOKEN_ERROR = ("Missing or outdated page token: open the URL BranchLens 
 NO_ORIGIN_ERROR = "Requests that do not say which page sent them (Origin) are refused."
 # Why Run cannot start when the Claude Code CLI is missing.
 NO_CLAUDE_CLI_REASON = "Run needs the Claude Code CLI (claude) on PATH."
+# Each running server writes its port, process id and URL to a state file,
+# one per repository, so `branchlens --status` can find it again. The
+# folder is ~/.branchlens unless this variable names another (test.sh does).
+STATE_DIR_VARIABLE = "BRANCHLENS_STATE_DIR"
+# The URL a state file holds, as main() prints it: the port and the launch code.
+STATE_URL_PATTERN = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})/\?token=([0-9a-f]{64})")
+# How long --status waits for the server named in a state file to answer.
+STATUS_PING_SECONDS = 5
 NO_COOKIE_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>BranchLens</title></head>
@@ -1735,6 +1745,126 @@ def normalise_host_suffixes(values):
     return suffixes
 
 
+def state_directory():
+    """The folder of the state files: $BRANCHLENS_STATE_DIR, else ~/.branchlens."""
+    configured = os.environ.get(STATE_DIR_VARIABLE, "")
+    if configured != "":
+        return os.path.abspath(os.path.expanduser(configured))
+    return str(Path.home() / ".branchlens")
+
+
+def state_file_path(main_repo_root):
+    """The state file of one repository: <repository folder>-<12 hex digits>.json.
+
+    The hex digits come from the repository's full path, so two clones with
+    the same folder name get a file each. Every worktree of a repository has
+    the same main folder, so they share one file.
+    """
+    path_digest = hashlib.sha256(main_repo_root.encode("utf-8", "surrogateescape")).hexdigest()
+    file_name = Path(main_repo_root).name + "-" + path_digest[:12] + ".json"
+    return os.path.join(state_directory(), file_name)
+
+
+def write_state_file(state_path, details):
+    """Save details (a dict) as JSON in state_path, readable by the owner only.
+
+    The URL in it lets a browser in, hence mode 0600, and 0700 for a folder
+    it creates. The text goes to a new temporary file that then replaces the
+    old one in a single rename, so a reader never sees half a file.
+    """
+    os.makedirs(os.path.dirname(state_path), mode=0o700, exist_ok=True)
+    temporary_path = state_path + "." + str(os.getpid()) + ".tmp"
+    try:
+        os.unlink(temporary_path)
+    except FileNotFoundError:
+        pass
+    # O_EXCL creates a new file, so the 0600 mode given here is the one it gets.
+    descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(details, handle)
+        handle.write("\n")
+    os.replace(temporary_path, state_path)
+
+
+def read_state_file(state_path):
+    """The dict a server saved in state_path, or None when there is no readable one."""
+    try:
+        with open(state_path, encoding="utf-8") as handle:
+            details = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(details, dict):
+        return None
+    return details
+
+
+def remove_state_file(state_path, launch_id):
+    """Delete state_path, but only if this server wrote it.
+
+    A second server started on the same repository replaces the file with
+    its own; then the file is left for that server to remove when it stops.
+    """
+    details = read_state_file(state_path)
+    if details is None or details.get("launch_id") != launch_id:
+        return
+    try:
+        os.unlink(state_path)
+    except OSError:
+        pass
+
+
+def server_answers(url):
+    """True when the BranchLens that printed url still answers on its port.
+
+    It opens the URL as a browser does, without following the redirect.
+    Only the server that made the code in the URL answers 303; a newer
+    server on the same port, or any other program, does not.
+    """
+    if not isinstance(url, str):
+        return False
+    match = STATE_URL_PATTERN.fullmatch(url)
+    if match is None:
+        return False
+    port = int(match.group(1))
+    if port < 1 or port > 65535:
+        return False
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=STATUS_PING_SECONDS)
+    try:
+        connection.request("GET", "/?token=" + match.group(2))
+        response = connection.getresponse()
+        return response.status == 303
+    except (OSError, http.client.HTTPException):
+        return False
+    finally:
+        connection.close()
+
+
+def show_status(path):
+    """branchlens --status PATH: report the server already running on that repository.
+
+    Prints the same "BranchLens serving" line a start prints and returns 0,
+    or says none is running and returns 1 (2 when PATH is not in a git
+    repository). The state file alone is never trusted: a server killed
+    without warning leaves its file behind, so the server must answer too.
+    """
+    from branchlens import gitops  # lazy import, see the note at the top of the file
+
+    try:
+        main_repo_root, _launch_worktree_root = gitops.find_repo_root(path)
+    except gitops.GitError as error:
+        print("branchlens: " + str(error), file=sys.stderr)
+        return 2
+    repo_name = Path(main_repo_root).name
+    details = read_state_file(state_file_path(main_repo_root))
+    if details is not None and details.get("repo_root") == main_repo_root:
+        url = details.get("url")
+        if server_answers(url):
+            print(f"BranchLens serving {repo_name} at {url}", flush=True)
+            return 0
+    print(f"BranchLens is not running for {repo_name}.", flush=True)
+    return 1
+
+
 def stop_on_signal(_signal_number, _frame):
     # `kill` (SIGTERM) and a closed terminal (SIGHUP) stop the server like
     # Ctrl+C, so main()'s clean-up runs.
@@ -1749,9 +1879,38 @@ def print_if_possible(text):
         pass
 
 
+class IdleExit(Exception):
+    """Raised inside serve_forever() when --idle-exit's time passed with no request."""
+
+
 class BranchLensServer(ThreadingHTTPServer):
     # Connections waiting to be accepted; the default of 5 resets a burst of more.
     request_queue_size = 64
+    # Seconds with no request after which the server stops (--idle-exit), or
+    # None to keep serving until it is stopped.
+    idle_exit_seconds = None
+    # time.monotonic() of the latest request; main() sets it at start too.
+    last_request_time = 0.0
+
+    def process_request(self, request, client_address):
+        # Every connection counts as activity for --idle-exit: the page's
+        # polling and `branchlens --status` included.
+        self.last_request_time = time.monotonic()
+        super().process_request(request, client_address)
+
+    def service_actions(self):
+        # serve_forever() calls this about twice a second. Raising here ends
+        # serve_forever(); main() catches IdleExit.
+        super().service_actions()
+        if self.idle_exit_seconds is None:
+            return
+        if RUNNER.is_active():
+            # Stopping the server would stop the check it started, so a
+            # running check counts as activity.
+            self.last_request_time = time.monotonic()
+            return
+        if time.monotonic() - self.last_request_time >= self.idle_exit_seconds:
+            raise IdleExit()
 
     def server_bind(self):
         # HTTPServer.server_bind also calls socket.getfqdn, a reverse DNS
@@ -1779,6 +1938,19 @@ def create_server(preferred_port):
             # OverflowError covers a --port value outside 0..65535.
             continue
     raise OSError("Could not find a free port to listen on.")
+
+
+def positive_minutes(text):
+    """argparse type of --idle-exit: a number of minutes above zero, fractions allowed."""
+    try:
+        minutes = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a number of minutes, got " + repr(text))
+    # float() also accepts "nan" and "inf"; neither passes this test.
+    if not 0 < minutes < float("inf"):
+        raise argparse.ArgumentTypeError("expected a number of minutes above zero, got "
+                                         + repr(text))
+    return minutes
 
 
 def opens_browser_by_default(platform):
@@ -1860,8 +2032,25 @@ def main():
              "(repeatable; also read from BRANCHLENS_NO_PUSH_HOSTS, "
              "comma-separated)",
     )
+    parser.add_argument(
+        "--idle-exit",
+        type=positive_minutes,
+        default=None,
+        metavar="MINUTES",
+        help="stop after MINUTES with no request (default: never); a security "
+             "check this server started counts as activity",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="start nothing: print the URL of the BranchLens already serving "
+             "the repository at path and exit 0, or say none is and exit 1",
+    )
     parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     args = parser.parse_args()
+
+    if args.status:
+        sys.exit(show_status(args.path))
 
     from branchlens import gitops
 
@@ -1925,11 +2114,29 @@ def main():
         pass
 
     server = create_server(args.port)
+    if args.idle_exit is not None:
+        server.idle_exit_seconds = args.idle_exit * 60
+    server.last_request_time = time.monotonic()
     # server_address holds the real port, needed when the OS picked one.
     actual_port = server.server_address[1]
     repo_name = Path(main_repo_root).name
     # The code in the URL is what lets a browser in (see route_request).
     url = f"http://127.0.0.1:{actual_port}/?token={BranchLensHandler.launch_code}"
+    # Written before the line below is printed, so --status finds the server
+    # as soon as that line appears.
+    state_path = state_file_path(main_repo_root)
+    try:
+        write_state_file(state_path, {
+            "repo_root": main_repo_root,
+            "port": actual_port,
+            "pid": os.getpid(),
+            "url": url,
+            "launch_id": BranchLensHandler.launch_id,
+        })
+    except OSError as error:
+        state_path = None
+        print("branchlens: warning: could not write the state file (" + str(error)
+              + "); branchlens --status will not find this server", file=sys.stderr)
     # flush=True: scripts that pipe our output read this line to learn the
     # port, and serve_forever() below never returns to flush the buffer.
     print(f"BranchLens serving {repo_name} at {url}", flush=True)
@@ -1953,7 +2160,12 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         print_if_possible("Stopped.")
+    except IdleExit:
+        # "{:g}" prints 120.0 as 120 and keeps a fraction such as 0.5.
+        print_if_possible("Stopped: no request for {:g} minutes.".format(args.idle_exit))
     finally:
+        if state_path is not None:
+            remove_state_file(state_path, BranchLensHandler.launch_id)
         # Each git child runs in a process group of its own, so neither
         # Ctrl+C nor the server's exit reaches it; one waiting on a named
         # pipe would otherwise outlive the server.

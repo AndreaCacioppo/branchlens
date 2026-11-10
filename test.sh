@@ -311,7 +311,14 @@ new_repo() {
 
 # ---------------------------------------------------------------- fixture repo
 
-FIXTURE=$(mktemp -d)
+# Stop if no temporary folder could be made: an empty FIXTURE would turn
+# every path below into one at the root of the disk. `! VAR=$(command)` is
+# true when the command failed.
+if ! FIXTURE=$(mktemp -d) || [ -z "$FIXTURE" ] || [ ! -d "$FIXTURE" ]; then
+  echo "FAIL: mktemp -d could not make a temporary folder"
+  FIXTURE=""
+  exit 1
+fi
 # The app.html source checks share one module: the page's text and the
 # body of one of its functions. Each check passes the page as argv[1].
 # PYTHONPATH also lets every Python snippet below, and `python3 -m
@@ -328,6 +335,13 @@ def function_body(name):
     return text[start:text.index("\n}\n", start)]
 PY
 export PYTHONPATH="$PROJECT_DIR/src:$FIXTURE/pylib"
+# Every server writes a state file for `branchlens --status`; the suite's
+# go to the fixture, never to the user's ~/.branchlens.
+export BRANCHLENS_STATE_DIR="$FIXTURE/branchlens-state"
+# The ssh config file the push check must be able to read: an empty one, so
+# the suite does not depend on this machine's ~/.ssh (a sandbox hides it).
+: > "$FIXTURE/ssh-config"
+export BRANCHLENS_SSH_CONFIG="$FIXTURE/ssh-config"
 REPO="$FIXTURE/repo"
 WORKTREE="$FIXTURE/wt"
 
@@ -7327,6 +7341,29 @@ json_check "environment: a host from BRANCHLENS_NO_PUSH_HOSTS is refused" "$ENV_
   'data["push"]["allowed"] is False and data["push"]["reason"] == "Repositories on code.work.example are pushed from another machine: port the change by hand."'
 git -C "$RUN_REPO" config --unset remote.origin.pushurl
 
+# ssh cannot read a config "file" that is a folder, as in a sandbox that
+# hides ~/.ssh. With a host blocked, an ssh push remote is then refused.
+mkdir -p "$FIXTURE/ssh-config-folder"
+SSHCFG_LOG="$FIXTURE/server-ssh-config.log"
+PREFLIGHT_TOOLKIT="$TOOLKIT" PREFLIGHT_REPORTS_DIR="$ENV_REPORTS" \
+  BRANCHLENS_NO_PUSH_HOSTS="work.example" BRANCHLENS_SSH_CONFIG="$FIXTURE/ssh-config-folder" \
+  python3 -m branchlens "$RUN_REPO" --port 0 --no-browser > "$SSHCFG_LOG" 2>&1 &
+SSHCFG_SERVER_PID=$!
+echo "$SSHCFG_SERVER_PID" >> "$FIXTURE/extra-pids"
+SSHCFG_PORT=$(wait_for_server "$SSHCFG_LOG")
+check "environment: server starts with an ssh config it cannot read" $?
+git -C "$RUN_REPO" config remote.origin.pushurl "git@code.example:team/app.git"
+http_get "$SSHCFG_PORT" "$ENV_SEC" "/api/security" > /dev/null
+json_check "environment: with ssh's config unreadable, an ssh push remote is refused and the reason says why" "$ENV_SEC" \
+  'data["push"]["allowed"] is False and data["push"]["reason"] == extra' \
+  "BranchLens cannot read ssh's config file here, so it cannot tell which host the ssh name code.example leads to, and Push is off for some hosts (--no-push-host): push from a terminal if that host is allowed."
+git -C "$RUN_REPO" config --unset remote.origin.pushurl
+http_get "$SSHCFG_PORT" "$ENV_SEC" "/api/security" > /dev/null
+json_check "environment: ...while the local origin still allows the push" "$ENV_SEC" \
+  'data["push"]["allowed"] is True'
+kill "$SSHCFG_SERVER_PID"
+process_ends "$SSHCFG_SERVER_PID"
+
 # The reports folder takes writes from the review's agents: a symlink put
 # where this server's log goes is refused, and the file it names is not truncated.
 LOG_LINK_TARGET="$FIXTURE/log-link-target.txt"
@@ -8257,6 +8294,243 @@ check "hangup: the run it started is stopped too" $?
 grep -q "Stopped the security check this server had started." "$HUP_LOG"
 check "hangup: the server says it stopped the run" $?
 
+# ---- the state file and --status ------------------------------------------------
+# A server writes $BRANCHLENS_STATE_DIR/<repository folder>-<hash>.json at
+# start and removes it when it stops. --status reads it and opens the URL in
+# it before it trusts it: a killed server leaves its file behind.
+
+STATUS_REPO="$FIXTURE/status-repo"
+new_repo "$STATUS_REPO"
+git -C "$STATUS_REPO" commit -q --allow-empty -m "Status fixture"
+git -C "$STATUS_REPO" worktree add -q -b status-side "$FIXTURE/status-wt"
+# The server names the repository by its physical path (symlinks resolved).
+STATUS_ROOT=$(cd "$STATUS_REPO" && pwd -P)
+STATUS_FILE=$(python3 -c 'import sys; from branchlens import server; print(server.state_file_path(sys.argv[1]))' "$STATUS_ROOT")
+STATUS_LOG="$FIXTURE/server-status.log"
+python3 -m branchlens "$STATUS_REPO" --port 0 --no-browser > "$STATUS_LOG" 2>&1 &
+STATUS_SERVER_PID=$!
+echo "$STATUS_SERVER_PID" >> "$FIXTURE/extra-pids"
+STATUS_PORT=$(wait_for_server "$STATUS_LOG")
+check "status: server starts" $?
+STATUS_URL=$(sed -n 's|^BranchLens serving status-repo at \(http://.*\)$|\1|p' "$STATUS_LOG" | head -n 1)
+
+python3 - "$STATUS_FILE" "$STATUS_SERVER_PID" "$STATUS_PORT" "$STATUS_URL" "$STATUS_ROOT" <<'PY'
+import json
+import os
+import re
+import stat
+import sys
+
+path, pid, port, url, root = sys.argv[1:6]
+with open(path, encoding="utf-8") as handle:
+    details = json.load(handle)
+launch_id = details.get("launch_id", "")
+expected = {"repo_root": root, "port": int(port), "pid": int(pid), "url": url,
+            "launch_id": launch_id}
+file_mode = stat.S_IMODE(os.stat(path).st_mode)
+folder_mode = stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode)
+ok = (details == expected and re.fullmatch(r"[0-9a-f]{16}", launch_id) is not None
+      and url != "" and file_mode == 0o600 and folder_mode == 0o700
+      and re.fullmatch(r"status-repo-[0-9a-f]{12}\.json", os.path.basename(path)) is not None)
+sys.exit(0 if ok else 1)
+PY
+check "status: the server writes its port, pid and URL to a state file only the owner can read" $?
+
+STATUS_OUT=$(python3 -m branchlens --status "$STATUS_REPO" 2>&1)
+STATUS_EXIT=$?
+[ "$STATUS_EXIT" -eq 0 ] && [ "$STATUS_OUT" = "BranchLens serving status-repo at $STATUS_URL" ]
+check "status: --status prints the running server's URL and exits 0" $? "exit $STATUS_EXIT: $STATUS_OUT"
+STATUS_OUT=$(cd "$FIXTURE/status-wt" && "$PROJECT_DIR/branchlens" --status 2>&1)
+STATUS_EXIT=$?
+[ "$STATUS_EXIT" -eq 0 ] && [ "$STATUS_OUT" = "BranchLens serving status-repo at $STATUS_URL" ]
+check "status: the launcher's --status, run in a linked worktree, finds the same server" $? "exit $STATUS_EXIT: $STATUS_OUT"
+STATUS_OUT=$(python3 -m branchlens --status "$FIXTURE/pylib" 2>&1)
+STATUS_EXIT=$?
+[ "$STATUS_EXIT" -eq 2 ] && printf '%s\n' "$STATUS_OUT" | grep -q "is not inside a git repository"
+check "status: --status outside a git repository says so and exits 2" $? "exit $STATUS_EXIT: $STATUS_OUT"
+python3 -m branchlens --help | grep -q -- "--status"
+check "status: --help lists --status" $?
+
+# --status must exit 1 and say that no server runs. $1: the check's description.
+status_says_not_running() {
+  local output
+  local exit_code
+  output=$(python3 -m branchlens --status "$STATUS_REPO" 2>&1)
+  exit_code=$?
+  [ "$exit_code" -eq 1 ] && [ "$output" = "BranchLens is not running for status-repo." ]
+  check "$1" $? "exit $exit_code: $output"
+}
+# Put the saved state file back with one key changed. $1: the key, $2: its
+# new value as JSON.
+rewrite_status_file() {
+  python3 - "$FIXTURE/status-good.json" "$STATUS_FILE" "$1" "$2" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    details = json.load(handle)
+details[sys.argv[3]] = json.loads(sys.argv[4])
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(details, handle)
+PY
+}
+cp "$STATUS_FILE" "$FIXTURE/status-good.json"
+# The launch code: what follows "token=" in the URL (## drops the longest
+# match of the pattern from the front).
+STATUS_CODE=${STATUS_URL##*token=}
+# A port nothing listens on: the OS hands out a free one, which is closed again.
+FREE_PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+WRONG_CODE=$(python3 -c 'print("0" * 64)')
+rewrite_status_file url "\"http://127.0.0.1:$STATUS_PORT/?token=$WRONG_CODE\""
+status_says_not_running "status: a state file whose code the server on that port does not know is not trusted"
+rewrite_status_file url "\"http://127.0.0.1:$FREE_PORT/?token=$STATUS_CODE\""
+status_says_not_running "status: a state file naming a port nothing listens on is not trusted"
+rewrite_status_file url "\"http://localhost:$STATUS_PORT/?token=$STATUS_CODE\""
+status_says_not_running "status: a URL not in the shape BranchLens prints is not trusted"
+rewrite_status_file repo_root '"/somewhere/else"'
+status_says_not_running "status: a state file for another repository is not trusted"
+printf 'not json\n' > "$STATUS_FILE"
+status_says_not_running "status: an unreadable state file means no server"
+cp "$FIXTURE/status-good.json" "$STATUS_FILE"
+STATUS_OUT=$(python3 -m branchlens --status "$STATUS_REPO" 2>&1)
+[ "$STATUS_OUT" = "BranchLens serving status-repo at $STATUS_URL" ]
+check "status: the restored state file finds the server again" $? "$STATUS_OUT"
+
+# A second server on the same repository takes the file over. The first
+# leaves it in place when it stops; the second removes it.
+STATUS_LOG2="$FIXTURE/server-status2.log"
+python3 -m branchlens "$FIXTURE/status-wt" --port 0 --no-browser > "$STATUS_LOG2" 2>&1 &
+STATUS_SERVER2_PID=$!
+echo "$STATUS_SERVER2_PID" >> "$FIXTURE/extra-pids"
+wait_for_server "$STATUS_LOG2" > /dev/null
+STATUS_URL2=$(sed -n 's|^BranchLens serving status-repo at \(http://.*\)$|\1|p' "$STATUS_LOG2" | head -n 1)
+STATUS_OUT=$(python3 -m branchlens --status "$STATUS_REPO" 2>&1)
+[ -n "$STATUS_URL2" ] && [ "$STATUS_URL2" != "$STATUS_URL" ] && \
+  [ "$STATUS_OUT" = "BranchLens serving status-repo at $STATUS_URL2" ]
+check "status: a second server on the same repository takes the state file over" $? "$STATUS_OUT"
+kill "$STATUS_SERVER_PID"
+process_ends "$STATUS_SERVER_PID" && [ -f "$STATUS_FILE" ] && \
+  [ "$(python3 -m branchlens --status "$STATUS_REPO" 2>&1)" = "BranchLens serving status-repo at $STATUS_URL2" ]
+check "status: the first server stops and leaves the second one's state file alone" $?
+kill "$STATUS_SERVER2_PID"
+process_ends "$STATUS_SERVER2_PID" && [ ! -e "$STATUS_FILE" ]
+check "status: a server removes its state file when it stops" $?
+status_says_not_running "status: with no server left, --status says so and exits 1"
+[ -z "$(ls -A "$(dirname "$STATUS_FILE")" | grep '\.tmp$')" ]
+check "status: no temporary state file is left behind" $?
+
+# A state folder that cannot be created costs only --status.
+STATUS_LOG3="$FIXTURE/server-status3.log"
+BRANCHLENS_STATE_DIR="$FIXTURE/pylib/pagesource.py/state" \
+  python3 -m branchlens "$STATUS_REPO" --port 0 --no-browser > "$STATUS_LOG3" 2>&1 &
+STATUS_SERVER3_PID=$!
+echo "$STATUS_SERVER3_PID" >> "$FIXTURE/extra-pids"
+STATUS_PORT3=$(wait_for_server "$STATUS_LOG3")
+expect_get "$STATUS_PORT3" "$RESPONSE" "/api/state" "200" \
+  "status: a server whose state folder cannot be created still serves"
+grep -q "warning: could not write the state file" "$STATUS_LOG3"
+check "status: ...and warns that --status will not find it" $?
+kill "$STATUS_SERVER3_PID"
+process_ends "$STATUS_SERVER3_PID"
+check "status: ...and stops cleanly" $?
+
+# ---- --idle-exit ----------------------------------------------------------------
+
+python3 - <<'PY'
+import argparse
+import sys
+
+from branchlens import server
+
+for bad_value in ["0", "-1", "abc", "", "nan", "inf", "-inf"]:
+    try:
+        server.positive_minutes(bad_value)
+    except argparse.ArgumentTypeError:
+        continue
+    print("  accepted:", repr(bad_value))
+    sys.exit(1)
+sys.exit(0 if server.positive_minutes("120") == 120 and server.positive_minutes("0.5") == 0.5 else 1)
+PY
+check "idle exit: minutes must be a number above zero; fractions are allowed" $?
+python3 -m branchlens "$STATUS_REPO" --port 0 --no-browser --idle-exit 0 > "$FIXTURE/idle-refused.log" 2>&1
+IDLE_EXIT_CODE=$?
+[ "$IDLE_EXIT_CODE" -eq 2 ] && grep -q "argument --idle-exit" "$FIXTURE/idle-refused.log"
+check "idle exit: --idle-exit 0 is refused before the server starts" $? "exit $IDLE_EXIT_CODE"
+
+python3 - <<'PY'
+import sys
+import time
+
+from branchlens import server
+
+
+def always_active():
+    return True
+
+
+httpd = server.create_server(0)
+try:
+    httpd.idle_exit_seconds = 1
+    # A running check: no stop, and the idle time starts again.
+    httpd.last_request_time = time.monotonic() - 5
+    server.RUNNER.is_active = always_active
+    try:
+        httpd.service_actions()
+    finally:
+        del server.RUNNER.is_active
+    kept_running = time.monotonic() - httpd.last_request_time < 1
+    # No check and nothing for 5 seconds: stop.
+    httpd.last_request_time = time.monotonic() - 5
+    try:
+        httpd.service_actions()
+        stopped = False
+    except server.IdleExit:
+        stopped = True
+    # Without --idle-exit nothing ever stops it.
+    httpd.idle_exit_seconds = None
+    httpd.last_request_time = 0.0
+    httpd.service_actions()
+finally:
+    httpd.server_close()
+sys.exit(0 if kept_running and stopped else 1)
+PY
+check "idle exit: a security check the server started counts as activity" $?
+
+IDLE_LOG="$FIXTURE/server-idle.log"
+python3 -m branchlens "$STATUS_REPO" --port 0 --no-browser --idle-exit 0.1 > "$IDLE_LOG" 2>&1 &
+IDLE_SERVER_PID=$!
+echo "$IDLE_SERVER_PID" >> "$FIXTURE/extra-pids"
+IDLE_PORT=$(wait_for_server "$IDLE_LOG")
+check "idle exit: server starts with --idle-exit 0.1 (6 seconds)" $?
+# One request a second for 8 seconds keeps it running.
+IDLE_ALIVE="yes"
+for idle_round in 1 2 3 4 5 6 7 8; do
+  sleep 1
+  STATUS=$(http_get "$IDLE_PORT" "$RESPONSE" "/api/state")
+  if [ "$STATUS" != "200" ]; then
+    IDLE_ALIVE="request $idle_round got HTTP $STATUS"
+  fi
+done
+[ "$IDLE_ALIVE" = "yes" ] && kill -0 "$IDLE_SERVER_PID" 2>/dev/null
+check "idle exit: requests keep the server running past its idle time" $? "$IDLE_ALIVE"
+IDLE_QUIET_FROM=$SECONDS
+# process_ends gives up after 5 seconds; this waits up to 20.
+idle_wait=0
+while kill -0 "$IDLE_SERVER_PID" 2>/dev/null && [ "$idle_wait" -lt 200 ]; do
+  sleep 0.1
+  idle_wait=$((idle_wait + 1))
+done
+IDLE_QUIET_SECONDS=$((SECONDS - IDLE_QUIET_FROM))
+! kill -0 "$IDLE_SERVER_PID" 2>/dev/null && [ "$IDLE_QUIET_SECONDS" -ge 4 ]
+check "idle exit: after 6 seconds with no request the server stops by itself" $? \
+  "stopped after about $IDLE_QUIET_SECONDS s"
+grep -qx "Stopped: no request for 0.1 minutes." "$IDLE_LOG"
+check "idle exit: ...says why" $?
+[ ! -e "$STATUS_FILE" ]
+check "idle exit: ...and removes its state file" $?
+python3 -m branchlens --help | grep -q -- "--idle-exit MINUTES"
+check "idle exit: --help lists --idle-exit" $?
+
 # ---- --no-push-host and the host a push really reaches (g135) --------------------
 
 SSH_SHIM="$FIXTURE/ssh-shim"
@@ -8310,6 +8584,61 @@ for urls, expected in cases:
 sys.exit(0)
 PY
 check "blocked host: %-escapes, IPv6 literals and an ssh alias's HostName are all checked" $?
+
+# When ssh cannot read its config file, `ssh -G` hands an alias back
+# unchanged, so it says nothing about where the alias leads. With a host
+# blocked, every ssh remote then counts as blocked.
+mkdir -p "$FIXTURE/ssh-config-folder"
+printf 'Host work-alias\n  HostName git.work.example\n' > "$FIXTURE/ssh-config-locked"
+chmod 000 "$FIXTURE/ssh-config-locked"
+PATH="$SSH_SHIM:$PATH" python3 - "$FIXTURE" <<'PY'
+import os
+import sys
+
+from branchlens import publish
+
+fixture = sys.argv[1]
+blocked = ["work.example"]
+unreadable_configs = [os.path.join(fixture, "ssh-config-folder")]
+locked = os.path.join(fixture, "ssh-config-locked")
+# root reads a file whatever its mode
+if not os.access(locked, os.R_OK):
+    unreadable_configs.append(locked)
+cases = [
+    (["other-alias:team/app.git"], "other-alias"),
+    (["ssh://me@other-alias/team/app.git"], "other-alias"),
+    (["git@code.example:team/app.git"], "code.example"),
+    # an alias ssh did resolve keeps its HostName
+    (["work-alias:team/app.git"], "git.work.example"),
+    # https and local paths do not go through ssh
+    (["https://other-alias/team/app.git"], None),
+    (["/srv/repos/app.git"], None),
+]
+for config in unreadable_configs:
+    os.environ["BRANCHLENS_SSH_CONFIG"] = config
+    if not publish.ssh_config_unreadable():
+        print("  readable:", config)
+        sys.exit(1)
+    for urls, expected in cases:
+        found = publish.find_blocked_host(".", "origin", urls, blocked)
+        if found != expected:
+            print("  find_blocked_host", config, urls, "->", found)
+            sys.exit(1)
+    # With no host blocked there is nothing to refuse.
+    if publish.find_blocked_host(".", "origin", ["other-alias:team/app.git"], []) is not None:
+        sys.exit(1)
+# A missing config file, or a readable one, leaves ssh's answer trusted.
+for config in [os.path.join(fixture, "no-such-ssh-config"), os.path.join(fixture, "ssh-config")]:
+    os.environ["BRANCHLENS_SSH_CONFIG"] = config
+    if publish.ssh_config_unreadable():
+        print("  unreadable:", config)
+        sys.exit(1)
+    if publish.find_blocked_host(".", "origin", ["other-alias:team/app.git"], blocked) is not None:
+        sys.exit(1)
+sys.exit(0)
+PY
+check "blocked host: when ssh cannot read its config, every ssh remote counts as blocked" $?
+chmod 600 "$FIXTURE/ssh-config-locked"
 
 # ---- Push after a run from a picked base: narrow, or the whole history -------------
 # The page sends the base it shows: a commit picked with "compare from here",
@@ -10381,6 +10710,15 @@ grep -q "Report a vulnerability" "$PROJECT_DIR/README.md"
 check "the README names the private reporting route" $?
 grep -q "bash test.sh" "$PROJECT_DIR/README.md"
 check "the README says how to run the tests" $?
+# test.sh itself stops at once when mktemp -d fails, before any path is built.
+mkdir -p "$FIXTURE/failing-mktemp"
+printf '#!/bin/sh\nexit 1\n' > "$FIXTURE/failing-mktemp/mktemp"
+chmod +x "$FIXTURE/failing-mktemp/mktemp"
+NO_TEMP_OUTPUT=$(PATH="$FIXTURE/failing-mktemp:$PATH" bash "$PROJECT_DIR/test.sh" 2>&1)
+NO_TEMP_EXIT=$?
+[ "$NO_TEMP_EXIT" -eq 1 ] && \
+  [ "$NO_TEMP_OUTPUT" = "FAIL: mktemp -d could not make a temporary folder" ]
+check "test.sh stops when mktemp -d fails" $? "exit $NO_TEMP_EXIT: $(printf '%s' "$NO_TEMP_OUTPUT" | head -c 300)"
 DEMO_GIF="$PROJECT_DIR/docs/demo.gif"
 DEMO_GIF_BYTES=0
 DEMO_GIF_SIGNATURE=""
