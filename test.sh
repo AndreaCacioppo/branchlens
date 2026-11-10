@@ -331,6 +331,10 @@ export PYTHONPATH="$PROJECT_DIR/src:$FIXTURE/pylib"
 # Every server writes a state file for `branchlens --status`; the suite's
 # go to the fixture, never to the user's ~/.branchlens.
 export BRANCHLENS_STATE_DIR="$FIXTURE/branchlens-state"
+# The ssh config file the push check must be able to read: an empty one, so
+# the suite does not depend on this machine's ~/.ssh (a sandbox hides it).
+: > "$FIXTURE/ssh-config"
+export BRANCHLENS_SSH_CONFIG="$FIXTURE/ssh-config"
 REPO="$FIXTURE/repo"
 WORKTREE="$FIXTURE/wt"
 
@@ -7330,6 +7334,29 @@ json_check "environment: a host from BRANCHLENS_NO_PUSH_HOSTS is refused" "$ENV_
   'data["push"]["allowed"] is False and data["push"]["reason"] == "Repositories on code.work.example are pushed from another machine: port the change by hand."'
 git -C "$RUN_REPO" config --unset remote.origin.pushurl
 
+# ssh cannot read a config "file" that is a folder, as in a sandbox that
+# hides ~/.ssh. With a host blocked, an ssh push remote is then refused.
+mkdir -p "$FIXTURE/ssh-config-folder"
+SSHCFG_LOG="$FIXTURE/server-ssh-config.log"
+PREFLIGHT_TOOLKIT="$TOOLKIT" PREFLIGHT_REPORTS_DIR="$ENV_REPORTS" \
+  BRANCHLENS_NO_PUSH_HOSTS="work.example" BRANCHLENS_SSH_CONFIG="$FIXTURE/ssh-config-folder" \
+  python3 -m branchlens "$RUN_REPO" --port 0 --no-browser > "$SSHCFG_LOG" 2>&1 &
+SSHCFG_SERVER_PID=$!
+echo "$SSHCFG_SERVER_PID" >> "$FIXTURE/extra-pids"
+SSHCFG_PORT=$(wait_for_server "$SSHCFG_LOG")
+check "environment: server starts with an ssh config it cannot read" $?
+git -C "$RUN_REPO" config remote.origin.pushurl "git@code.example:team/app.git"
+http_get "$SSHCFG_PORT" "$ENV_SEC" "/api/security" > /dev/null
+json_check "environment: with ssh's config unreadable, an ssh push remote is refused and the reason says why" "$ENV_SEC" \
+  'data["push"]["allowed"] is False and data["push"]["reason"] == extra' \
+  "BranchLens cannot read ssh's config file here, so it cannot tell which host the ssh name code.example leads to, and Push is off for some hosts (--no-push-host): push from a terminal if that host is allowed."
+git -C "$RUN_REPO" config --unset remote.origin.pushurl
+http_get "$SSHCFG_PORT" "$ENV_SEC" "/api/security" > /dev/null
+json_check "environment: ...while the local origin still allows the push" "$ENV_SEC" \
+  'data["push"]["allowed"] is True'
+kill "$SSHCFG_SERVER_PID"
+process_ends "$SSHCFG_SERVER_PID"
+
 # The reports folder takes writes from the review's agents: a symlink put
 # where this server's log goes is refused, and the file it names is not truncated.
 LOG_LINK_TARGET="$FIXTURE/log-link-target.txt"
@@ -8550,6 +8577,61 @@ for urls, expected in cases:
 sys.exit(0)
 PY
 check "blocked host: %-escapes, IPv6 literals and an ssh alias's HostName are all checked" $?
+
+# When ssh cannot read its config file, `ssh -G` hands an alias back
+# unchanged, so it says nothing about where the alias leads. With a host
+# blocked, every ssh remote then counts as blocked.
+mkdir -p "$FIXTURE/ssh-config-folder"
+printf 'Host work-alias\n  HostName git.work.example\n' > "$FIXTURE/ssh-config-locked"
+chmod 000 "$FIXTURE/ssh-config-locked"
+PATH="$SSH_SHIM:$PATH" python3 - "$FIXTURE" <<'PY'
+import os
+import sys
+
+from branchlens import publish
+
+fixture = sys.argv[1]
+blocked = ["work.example"]
+unreadable_configs = [os.path.join(fixture, "ssh-config-folder")]
+locked = os.path.join(fixture, "ssh-config-locked")
+# root reads a file whatever its mode
+if not os.access(locked, os.R_OK):
+    unreadable_configs.append(locked)
+cases = [
+    (["other-alias:team/app.git"], "other-alias"),
+    (["ssh://me@other-alias/team/app.git"], "other-alias"),
+    (["git@code.example:team/app.git"], "code.example"),
+    # an alias ssh did resolve keeps its HostName
+    (["work-alias:team/app.git"], "git.work.example"),
+    # https and local paths do not go through ssh
+    (["https://other-alias/team/app.git"], None),
+    (["/srv/repos/app.git"], None),
+]
+for config in unreadable_configs:
+    os.environ["BRANCHLENS_SSH_CONFIG"] = config
+    if not publish.ssh_config_unreadable():
+        print("  readable:", config)
+        sys.exit(1)
+    for urls, expected in cases:
+        found = publish.find_blocked_host(".", "origin", urls, blocked)
+        if found != expected:
+            print("  find_blocked_host", config, urls, "->", found)
+            sys.exit(1)
+    # With no host blocked there is nothing to refuse.
+    if publish.find_blocked_host(".", "origin", ["other-alias:team/app.git"], []) is not None:
+        sys.exit(1)
+# A missing config file, or a readable one, leaves ssh's answer trusted.
+for config in [os.path.join(fixture, "no-such-ssh-config"), os.path.join(fixture, "ssh-config")]:
+    os.environ["BRANCHLENS_SSH_CONFIG"] = config
+    if publish.ssh_config_unreadable():
+        print("  unreadable:", config)
+        sys.exit(1)
+    if publish.find_blocked_host(".", "origin", ["other-alias:team/app.git"], blocked) is not None:
+        sys.exit(1)
+sys.exit(0)
+PY
+check "blocked host: when ssh cannot read its config, every ssh remote counts as blocked" $?
+chmod 600 "$FIXTURE/ssh-config-locked"
 
 # ---- Push after a run from a picked base: narrow, or the whole history -------------
 # The page sends the base it shows: a commit picked with "compare from here",

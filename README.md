@@ -72,7 +72,8 @@ must have judged every commit the push would send: after a run from a picked
 commit, Push stays off while the remote lacks older ones, and a run from the
 beginning covers them all. BranchLens never fetches, so what the remote has
 is what the last fetch or push saw. `--no-push-host HOST` turns Push off for
-a host.
+a host. If ssh cannot read its config file, as inside a sandbox, it cannot
+say where an alias leads, and with a host blocked every ssh remote is too.
 
 `toolkit/preflight.sh check /path/to/repo [base]` runs the scanners alone,
 without Claude (exit 0 passed, 1 failed, 2 inconclusive). Reports go to
