@@ -12,7 +12,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Ubuntu is pinned: "ubuntu-latest" became 26.04 in November 2026,
+        # which has no Python 3.9 build and where Semgrep does not run.
+        os: [ubuntu-24.04, macos-latest]
         python-version: ["3.9", "3.x"]
         exclude:
           # setup-python's newest Python 3.9 for the arm64 macOS runners is
@@ -37,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
