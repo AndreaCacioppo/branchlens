@@ -1505,6 +1505,71 @@ body {
   color: var(--add-fg);
 }
 .copy-file:hover { text-decoration: underline; }
+/* the edit button, and the editor that takes the diff's place */
+.edit-file {
+  flex: none;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 10px;
+  border: 1px solid var(--accent);
+  background: var(--canvas);
+  color: var(--accent);
+  cursor: pointer;
+}
+.edit-file:hover { text-decoration: underline; }
+.edit-file:disabled { cursor: default; text-decoration: none; opacity: 0.6; }
+.editor-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.editor-bar .editor-path { font-size: 12px; }
+.editor-bar .editor-status { color: var(--muted); }
+.editor-bar .editor-status.problem { color: var(--del-fg); }
+.editor-bar .editor-status.saved { color: var(--add-fg); }
+.editor-bar .editor-hint { color: var(--muted); margin-left: auto; }
+.editor-bar button {
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--canvas);
+  color: var(--text);
+  cursor: pointer;
+}
+.editor-bar button.primary {
+  border-color: var(--add-fg);
+  background: var(--add-line-bg);
+  color: var(--add-fg);
+}
+.editor-bar button:disabled { cursor: default; opacity: 0.6; }
+.editor-text {
+  display: block;
+  width: 100%;
+  /* the window's height less the header, the file's header and the bar */
+  height: calc(100vh - 170px);
+  min-height: 240px;
+  padding: 8px 12px;
+  border: none;
+  outline: none;
+  resize: none;
+  font-family: var(--mono-font);
+  font-size: 12px;
+  line-height: 20px;
+  tab-size: 4;
+  color: var(--text);
+  background: var(--canvas);
+  white-space: pre;
+  overflow: auto;
+}
 /* the comments toggle: when on, it marks the comments and fades the rest */
 .comments-toggle {
   flex: none;
@@ -2316,7 +2381,7 @@ function readPageToken() {
 var PAGE_TOKEN = readPageToken();
 
 // POST a JSON body with the page token; same result shape as fetchJson.
-// Only Run, Cancel and Push use it.
+// Only Run, Cancel, Push and the editor's Save use it.
 function postJson(url, body) {
   var options = {
     method: "POST",
@@ -4729,6 +4794,297 @@ function commentsBannerText() {
   return sentence + changed + " added or deleted lines hold a comment.";
 }
 
+/* ---- The editor ---- */
+
+// The editor shows the file on disk in a branch's worktree in a text box
+// that takes the diff's place; Save writes it back (/api/save-file).
+//
+// The file open in the editor, or null:
+// {branch, path, sha256, savedText, indentUnit, holder, textArea,
+//  statusElement, saveButton, busy, problem, justSaved}.
+// sha256 is the hash of the file as last read or saved; the server refuses a
+// save when the file on disk no longer has it. renderDiffBody never redraws
+// an open editor, so the 2-second refresh keeps what is being typed.
+var editorSession = null;
+
+function canEditEntry(entry) {
+  if (currentState === null || currentState.editing !== true || selectedBranchName === null) {
+    return false;
+  }
+  var branch = findBranchInState(selectedBranchName);
+  if (branch === null || branch.worktree_path === null) {
+    return false;
+  }
+  return entry.status !== "D" && !entry.binary && !isDirectoryEntry(entry);
+}
+
+function editorIsOpenForSelection() {
+  return editorSession !== null && editorSession.branch === selectedBranchName &&
+    editorSession.path === selectedFilePath && selectedCommitSha === null;
+}
+
+function editorHasUnsavedText() {
+  return editorSession !== null &&
+    editorSession.textArea.value !== editorSession.savedText;
+}
+
+// Closes the editor and returns true, unless it holds unsaved text and the
+// user chooses to keep it: then it stays open and this returns false.
+function leaveEditor() {
+  if (editorSession === null) {
+    return true;
+  }
+  if (editorHasUnsavedText() &&
+      !window.confirm("Discard your unsaved changes to " + editorSession.path + "?")) {
+    return false;
+  }
+  editorSession = null;
+  return true;
+}
+
+function closeEditor() {
+  if (leaveEditor()) {
+    renderDiffPane();
+  }
+}
+
+// The error sentence of a failed request, for the page.
+function requestErrorText(result) {
+  if (result.body && result.body.error) {
+    return String(result.body.error);
+  }
+  return "The server reported an unexpected problem.";
+}
+
+function makeEditFileButton(path) {
+  var button = makeText("button", "edit-file", "edit");
+  button.type = "button";
+  button.title = "Type changes into this file and save them to disk";
+  button.addEventListener("click", function () {
+    openEditor(path, button);
+  });
+  return button;
+}
+
+function openEditor(path, button) {
+  var branchName = selectedBranchName;
+  var url = "/api/edit-file?branch=" + encodeURIComponent(branchName) +
+    "&path=" + encodeURIComponent(path);
+  button.disabled = true;
+  fetchJson(url).then(function (result) {
+    button.disabled = false;
+    if (!result.ok || result.body === null || typeof result.body.text !== "string") {
+      showCopyNotice("Cannot edit: " + requestErrorText(result), EDITOR_NOTICE_MS);
+      return;
+    }
+    if (selectedBranchName !== branchName || selectedFilePath !== path ||
+        selectedCommitSha !== null || editorSession !== null) {
+      return; // another file or branch was opened meanwhile
+    }
+    editorSession = buildEditor(branchName, path, result.body.text, result.body.sha256);
+    renderDiffPane();
+    editorSession.textArea.focus();
+  }).catch(function () {
+    button.disabled = false;
+    showCopyNotice("Cannot edit: the server did not answer", EDITOR_NOTICE_MS);
+  });
+}
+
+// Errors from the editor stay up longer than the copy notices.
+var EDITOR_NOTICE_MS = 6000;
+
+// What one press of Tab inserts: a tab when most indented lines start with
+// one, else as many spaces as the smallest indentation in the file (4 when
+// the file has none).
+function guessIndentUnit(text) {
+  var lines = text.split("\n");
+  var tabLines = 0;
+  var spaceLines = 0;
+  var smallestSpaces = 0;
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i].charAt(0) === "\t") {
+      tabLines += 1;
+    } else if (lines[i].charAt(0) === " ") {
+      spaceLines += 1;
+      var spaces = lines[i].length - lines[i].replace(/^ +/, "").length;
+      if (spaces <= 8 && (smallestSpaces === 0 || spaces < smallestSpaces)) {
+        smallestSpaces = spaces;
+      }
+    }
+  }
+  if (tabLines > spaceLines) {
+    return "\t";
+  }
+  if (smallestSpaces < 2) {
+    smallestSpaces = 4; // a lone space is more likely alignment than indentation
+  }
+  return " ".repeat(smallestSpaces);
+}
+
+function buildEditor(branchName, path, text, sha256) {
+  var holder = makeElement("div", "editor");
+  var bar = makeElement("div", "editor-bar");
+  bar.appendChild(makeText("span", "editor-path mono", path));
+  var statusElement = makeText("span", "editor-status", "");
+  statusElement.setAttribute("role", "status");
+  bar.appendChild(statusElement);
+  var saveKey = /Mac|iPhone|iPad/.test(navigator.platform || "") ? "⌘S" : "Ctrl+S";
+  bar.appendChild(makeText("span", "editor-hint",
+    "Tab indents · " + saveKey + " saves · Esc closes"));
+  var saveButton = makeText("button", "primary", "save");
+  saveButton.type = "button";
+  var closeButton = makeText("button", "", "close");
+  closeButton.type = "button";
+  bar.appendChild(saveButton);
+  bar.appendChild(closeButton);
+
+  var textArea = makeElement("textarea", "editor-text");
+  textArea.spellcheck = false;
+  textArea.wrap = "off";
+  textArea.setAttribute("autocapitalize", "off");
+  textArea.setAttribute("autocomplete", "off");
+  textArea.setAttribute("aria-label", "Text of " + path);
+  // The text box turns "\r\n" into "\n", so savedText is read back from it.
+  textArea.value = text;
+  holder.appendChild(bar);
+  holder.appendChild(textArea);
+
+  var session = {
+    branch: branchName,
+    path: path,
+    sha256: sha256,
+    savedText: textArea.value,
+    indentUnit: guessIndentUnit(textArea.value),
+    holder: holder,
+    textArea: textArea,
+    statusElement: statusElement,
+    saveButton: saveButton,
+    busy: false,
+    problem: null,
+    justSaved: false
+  };
+  textArea.addEventListener("input", function () {
+    session.problem = null;
+    session.justSaved = false;
+    updateEditorStatus(session);
+  });
+  textArea.addEventListener("keydown", function (event) {
+    onEditorKeydown(session, event);
+  });
+  saveButton.addEventListener("click", function () {
+    saveEditor(session);
+  });
+  closeButton.addEventListener("click", closeEditor);
+  updateEditorStatus(session);
+  return session;
+}
+
+function updateEditorStatus(session) {
+  var text = "";
+  var kind = "";
+  if (session.busy) {
+    text = "Saving…";
+  } else if (session.problem !== null) {
+    text = session.problem;
+    kind = "problem";
+  } else if (session.textArea.value !== session.savedText) {
+    text = "Unsaved changes";
+  } else if (session.justSaved) {
+    text = "Saved";
+    kind = "saved";
+  }
+  session.statusElement.textContent = text;
+  session.statusElement.className = "editor-status" + (kind ? " " + kind : "");
+  session.saveButton.disabled = session.busy;
+}
+
+// Types text at the cursor, replacing any selection. execCommand keeps the
+// undo history; setRangeText, the fallback, does not.
+function insertInEditor(textArea, text) {
+  var inserted = false;
+  try {
+    inserted = document.execCommand("insertText", false, text);
+  } catch (error) {
+    inserted = false;
+  }
+  if (!inserted) {
+    textArea.setRangeText(text, textArea.selectionStart, textArea.selectionEnd, "end");
+    textArea.dispatchEvent(new Event("input"));
+  }
+}
+
+function onEditorKeydown(session, event) {
+  var textArea = session.textArea;
+  if ((event.metaKey || event.ctrlKey) && !event.altKey &&
+      (event.key === "s" || event.key === "S")) {
+    event.preventDefault(); // not the browser's "Save page as"
+    saveEditor(session);
+    return;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeEditor();
+    return;
+  }
+  if (event.metaKey || event.ctrlKey || event.altKey || event.isComposing) {
+    return;
+  }
+  if (event.key === "Tab" && !event.shiftKey) {
+    // Shift+Tab still moves the focus out of the text box.
+    event.preventDefault();
+    insertInEditor(textArea, session.indentUnit);
+    return;
+  }
+  if (event.key === "Enter" && !event.shiftKey) {
+    // A new line starts with the indentation of the line above.
+    event.preventDefault();
+    var before = textArea.value.slice(0, textArea.selectionStart);
+    var lineStart = before.lastIndexOf("\n") + 1;
+    var indentation = /^[ \t]*/.exec(before.slice(lineStart))[0];
+    insertInEditor(textArea, "\n" + indentation);
+  }
+}
+
+function saveEditor(session) {
+  if (session.busy) {
+    return;
+  }
+  var text = session.textArea.value;
+  session.busy = true;
+  session.problem = null;
+  updateEditorStatus(session);
+  postJson("/api/save-file", {
+    branch: session.branch,
+    path: session.path,
+    text: text,
+    sha256: session.sha256
+  }).then(function (result) {
+    session.busy = false;
+    if (result.ok && result.body !== null && typeof result.body.sha256 === "string") {
+      session.sha256 = result.body.sha256;
+      // What was sent is on disk; anything typed during the save is not.
+      session.savedText = text;
+      session.justSaved = true;
+      announce("Saved " + session.path);
+    } else {
+      session.problem = "Not saved: " + requestErrorText(result);
+    }
+    updateEditorStatus(session);
+  }, function () {
+    session.busy = false;
+    session.problem = "Not saved: the server did not answer.";
+    updateEditorStatus(session);
+  });
+}
+
+// A reload or a closed tab would lose unsaved text: the browser asks first.
+window.addEventListener("beforeunload", function (event) {
+  if (editorHasUnsavedText()) {
+    event.preventDefault();
+    event.returnValue = "";
+  }
+});
+
 function renderDiffSticky() {
   var toggleHadFocus = document.activeElement !== null &&
     document.activeElement.classList.contains("comments-toggle");
@@ -4779,6 +5135,9 @@ function drawDiffSticky() {
     if (entry.status !== "D") {
       miniHeader.appendChild(makeCopyFileButton(entry.path, "new"));
     }
+  }
+  if (!editorIsOpenForSelection() && canEditEntry(entry)) {
+    miniHeader.appendChild(makeEditFileButton(entry.path));
   }
   diffStickyElement.appendChild(miniHeader);
 
@@ -5020,6 +5379,15 @@ function showInDiffBody(element) {
 }
 
 function renderDiffBody() {
+  if (editorSession !== null) {
+    if (editorIsOpenForSelection()) {
+      if (editorSession.holder.parentNode !== diffBodyElement) {
+        showInDiffBody(editorSession.holder);
+      }
+      return;
+    }
+    editorSession = null; // its branch or file is no longer the one shown
+  }
   if (stateErrorText !== null) {
     showInDiffBody(makeCard([
       "This repository can't be shown right now: ",
@@ -5220,7 +5588,8 @@ function selectedDiffLines() {
   return lines.length === 0 ? null : lines;
 }
 
-function showCopyNotice(text) {
+// durationMs: how long the notice stays up (COPY_NOTICE_MS when not given).
+function showCopyNotice(text, durationMs) {
   copyNoticeElement.textContent = text;
   copyNoticeElement.hidden = false;
   if (copyNoticeTimer !== null) {
@@ -5229,7 +5598,7 @@ function showCopyNotice(text) {
   copyNoticeTimer = window.setTimeout(function () {
     copyNoticeElement.hidden = true;
     copyNoticeTimer = null;
-  }, COPY_NOTICE_MS);
+  }, durationMs || COPY_NOTICE_MS);
 }
 
 // Copies the selected code, if any, when a selection gesture ends.
@@ -5297,12 +5666,18 @@ function selectBranch(branchName) {
     loadDiff();
     return;
   }
+  if (!leaveEditor()) {
+    return; // the user kept their unsaved text
+  }
   selectedBranchName = branchName;
   selectedCommitSha = null;
   openSelection();
 }
 
 function selectCommit(sha) {
+  if (!leaveEditor()) {
+    return;
+  }
   selectedCommitSha = sha;
   selectedBranchName = null;
   openSelection();
@@ -5338,6 +5713,9 @@ function openSelection() {
 }
 
 function selectFile(path) {
+  if (editorSession !== null && editorSession.path !== path && !leaveEditor()) {
+    return; // the user kept their unsaved text
+  }
   if (pendingLineJump !== null && pendingLineJump.path !== path) {
     pendingLineJump = null; // another file was picked meanwhile
   }

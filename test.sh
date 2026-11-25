@@ -10334,6 +10334,139 @@ else
   echo "SKIP: node is not installed, so the extracted lane helpers were not run"
 fi
 
+# ---------------------------------------------------------------- editor: open and save a file
+
+# A repository of its own: edit-me is checked out in a linked worktree, whose
+# files the editor opens and saves; no-worktree is not checked out anywhere.
+EDIT_REPO="$FIXTURE/edit-repo"
+EDIT_WT="$FIXTURE/edit-worktree"
+new_repo "$EDIT_REPO"
+printf 'base\n' > "$EDIT_REPO/base.txt"
+git -C "$EDIT_REPO" add -A
+git -C "$EDIT_REPO" commit -q -m "Base"
+git -C "$EDIT_REPO" branch no-worktree
+git -C "$EDIT_REPO" worktree add -q -b edit-me "$EDIT_WT"
+printf 'def answer():\n    return 1\n' > "$EDIT_WT/code.py"
+printf '#!/bin/sh\necho hi\n' > "$EDIT_WT/run.sh"
+chmod 755 "$EDIT_WT/run.sh"
+printf 'first\r\nsecond\r\n' > "$EDIT_WT/windows.txt"
+printf 'text\x00with a zero byte\n' > "$EDIT_WT/data.bin"
+ln -s code.py "$EDIT_WT/link.py"
+printf 'outside the worktree\n' > "$FIXTURE/outside.txt"
+
+EDIT_LOG="$FIXTURE/server-edit.log"
+python3 -m branchlens "$EDIT_REPO" --port 0 --no-browser > "$EDIT_LOG" 2>&1 &
+echo "$!" >> "$FIXTURE/extra-pids"
+EDIT_PORT=$(wait_for_server "$EDIT_LOG")
+check "editor: the server starts" $?
+EDIT_TOKEN=$(page_token "$EDIT_PORT")
+READ_ONLY_LOG="$FIXTURE/server-read-only.log"
+python3 -m branchlens "$EDIT_REPO" --port 0 --no-browser --read-only > "$READ_ONLY_LOG" 2>&1 &
+echo "$!" >> "$FIXTURE/extra-pids"
+READ_ONLY_PORT=$(wait_for_server "$READ_ONLY_LOG")
+check "editor: a --read-only server starts" $?
+READ_ONLY_TOKEN=$(page_token "$READ_ONLY_PORT")
+EDIT_RESP="$FIXTURE/edit-response.json"
+
+# The SHA-256 of a file's bytes.
+file_sha256() {
+  python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
+}
+# A /api/save-file body: $1 branch, $2 path, $3 text (printf escapes such as
+# \n are read), $4 sha256. $(...) drops trailing newlines, so the text is
+# passed with an "x" after it, which Python cuts off.
+save_body() {
+  python3 -c 'import json, sys; print(json.dumps({"branch": sys.argv[1], "path": sys.argv[2], "text": sys.argv[3][:-1], "sha256": sys.argv[4]}))' \
+    "$1" "$2" "$(printf "$3"; printf x)" "$4"
+}
+
+expect_get "$EDIT_PORT" "$EDIT_RESP" "/api/state" "200" "editor: /api/state returns HTTP 200"
+json_check "editor: /api/state says editing is on" "$EDIT_RESP" 'data["editing"] is True'
+expect_get "$READ_ONLY_PORT" "$EDIT_RESP" "/api/state" "200" "editor: /api/state of a --read-only server returns HTTP 200"
+json_check "editor: with --read-only, /api/state says editing is off" "$EDIT_RESP" 'data["editing"] is False'
+
+expect_get "$EDIT_PORT" "$EDIT_RESP" "/api/edit-file?branch=edit-me&path=code.py" "200" "editor: opening a file returns HTTP 200"
+CODE_SHA=$(file_sha256 "$EDIT_WT/code.py")
+json_check "editor: opening a file gives its text and the hash of its bytes" "$EDIT_RESP" \
+  'data["path"] == "code.py" and data["text"] == "def answer():\n    return 1\n" and data["sha256"] == extra' "$CODE_SHA"
+
+STATUS=$(http_post "$EDIT_PORT" "$EDIT_RESP" /api/save-file "$EDIT_TOKEN" application/json \
+  "$(save_body edit-me code.py 'def answer():\n    return 42\n' "$CODE_SHA")")
+expect_status "200" "editor: saving with the hash from opening returns HTTP 200"
+NEW_CODE_SHA=$(file_sha256 "$EDIT_WT/code.py")
+json_check "editor: a save answers with the new hash" "$EDIT_RESP" \
+  'data["saved"] is True and data["sha256"] == extra' "$NEW_CODE_SHA"
+[ "$(cat "$EDIT_WT/code.py")" = "$(printf 'def answer():\n    return 42')" ]
+check "editor: the saved text is on disk" $?
+[ -z "$(find "$EDIT_WT" -maxdepth 1 -name '*.branchlens-save')" ]
+check "editor: a save leaves no temporary file behind" $?
+
+# The hash from before the save no longer matches: someone else's change
+# must not be overwritten.
+STATUS=$(http_post "$EDIT_PORT" "$EDIT_RESP" /api/save-file "$EDIT_TOKEN" application/json \
+  "$(save_body edit-me code.py 'stale text\n' "$CODE_SHA")")
+expect_status "409" "editor: saving over a file that changed since it was opened returns HTTP 409"
+json_check "editor: the conflict says the file changed on disk" "$EDIT_RESP" \
+  '"changed on disk" in data["error"]'
+[ "$(file_sha256 "$EDIT_WT/code.py")" = "$NEW_CODE_SHA" ]
+check "editor: a refused save leaves the file untouched" $?
+
+RUN_SH_SHA=$(file_sha256 "$EDIT_WT/run.sh")
+STATUS=$(http_post "$EDIT_PORT" "$EDIT_RESP" /api/save-file "$EDIT_TOKEN" application/json \
+  "$(save_body edit-me run.sh '#!/bin/sh\necho bye\n' "$RUN_SH_SHA")")
+expect_status "200" "editor: saving an executable file returns HTTP 200"
+[ -x "$EDIT_WT/run.sh" ] && grep -q "echo bye" "$EDIT_WT/run.sh"
+check "editor: a saved file keeps its executable bit" $?
+
+WINDOWS_SHA=$(file_sha256 "$EDIT_WT/windows.txt")
+STATUS=$(http_post "$EDIT_PORT" "$EDIT_RESP" /api/save-file "$EDIT_TOKEN" application/json \
+  "$(save_body edit-me windows.txt 'first\nsecond\nthird\n' "$WINDOWS_SHA")")
+expect_status "200" "editor: saving a file with Windows line endings returns HTTP 200"
+python3 -c 'import sys; sys.exit(0 if open(sys.argv[1], "rb").read() == b"first\r\nsecond\r\nthird\r\n" else 1)' "$EDIT_WT/windows.txt"
+check "editor: a file with Windows line endings keeps them after a save" $?
+
+# Files that must not be opened.
+expect_get "$EDIT_PORT" "$EDIT_RESP" "/api/edit-file?branch=edit-me&path=../outside.txt" "400" "editor: a path out of the worktree returns HTTP 400"
+expect_get "$EDIT_PORT" "$EDIT_RESP" "/api/edit-file?branch=edit-me&path=$FIXTURE/outside.txt" "400" "editor: an absolute path returns HTTP 400"
+expect_get "$EDIT_PORT" "$EDIT_RESP" "/api/edit-file?branch=edit-me&path=.git" "400" "editor: .git returns HTTP 400"
+expect_get "$EDIT_PORT" "$EDIT_RESP" "/api/edit-file?branch=edit-me&path=link.py" "400" "editor: a symbolic link returns HTTP 400"
+json_check "editor: the refusal names the symbolic link" "$EDIT_RESP" '"Symbolic links" in data["error"]'
+expect_get "$EDIT_PORT" "$EDIT_RESP" "/api/edit-file?branch=edit-me&path=data.bin" "400" "editor: a binary file returns HTTP 400"
+expect_get "$EDIT_PORT" "$EDIT_RESP" "/api/edit-file?branch=edit-me&path=missing.txt" "400" "editor: a missing file returns HTTP 400"
+expect_get "$EDIT_PORT" "$EDIT_RESP" "/api/edit-file?branch=no-worktree&path=base.txt" "400" "editor: a branch with no worktree returns HTTP 400"
+json_check "editor: the refusal says the branch is not checked out" "$EDIT_RESP" '"not checked out" in data["error"]'
+expect_get "$EDIT_PORT" "$EDIT_RESP" "/api/edit-file?branch=no-such-branch&path=base.txt" "404" "editor: an unknown branch returns HTTP 404"
+
+# Saves that must be refused.
+LINK_SHA=$(file_sha256 "$EDIT_WT/code.py")
+STATUS=$(http_post "$EDIT_PORT" "$EDIT_RESP" /api/save-file "$EDIT_TOKEN" application/json \
+  "$(save_body edit-me link.py 'through the link\n' "$LINK_SHA")")
+expect_status "400" "editor: saving through a symbolic link returns HTTP 400"
+OUTSIDE_SHA=$(file_sha256 "$FIXTURE/outside.txt")
+STATUS=$(http_post "$EDIT_PORT" "$EDIT_RESP" /api/save-file "$EDIT_TOKEN" application/json \
+  "$(save_body edit-me ../outside.txt 'overwritten\n' "$OUTSIDE_SHA")")
+expect_status "400" "editor: saving a path out of the worktree returns HTTP 400"
+grep -q "outside the worktree" "$FIXTURE/outside.txt"
+check "editor: the file outside the worktree is untouched" $?
+STATUS=$(http_post "$EDIT_PORT" "$EDIT_RESP" /api/save-file "" application/json \
+  "$(save_body edit-me code.py 'no token\n' "$NEW_CODE_SHA")")
+expect_status "403" "editor: a save without the page token returns HTTP 403"
+STATUS=$(http_post "$EDIT_PORT" "$EDIT_RESP" /api/save-file "$EDIT_TOKEN" application/json \
+  "$(save_body edit-me code.py 'other page\n' "$NEW_CODE_SHA")" -H "Origin: http://evil.example")
+expect_status "403" "editor: a save from another web page returns HTTP 403"
+[ "$(file_sha256 "$EDIT_WT/code.py")" = "$NEW_CODE_SHA" ]
+check "editor: refused saves leave the file untouched" $?
+
+# --read-only turns both routes off.
+expect_get "$READ_ONLY_PORT" "$EDIT_RESP" "/api/edit-file?branch=edit-me&path=code.py" "403" "editor: with --read-only, opening a file returns HTTP 403"
+STATUS=$(http_post "$READ_ONLY_PORT" "$EDIT_RESP" /api/save-file "$READ_ONLY_TOKEN" application/json \
+  "$(save_body edit-me code.py 'read only\n' "$NEW_CODE_SHA")")
+expect_status "403" "editor: with --read-only, a save returns HTTP 403"
+json_check "editor: the --read-only refusal says editing is off" "$EDIT_RESP" \
+  'data["error"] == "Editing is off: BranchLens was started with --read-only."'
+[ "$(file_sha256 "$EDIT_WT/code.py")" = "$NEW_CODE_SHA" ]
+check "editor: with --read-only the file is untouched" $?
+
 # ---------------------------------------------------------------- documentation
 
 # Every relative link in the documentation names a file that exists.
