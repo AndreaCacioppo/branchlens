@@ -2,8 +2,9 @@
 
 This file parses the command line, serves the page, answers the API in JSON,
 and starts or stops the security pipeline. gitops.py does the git reads.
-publish.py does the one write: a push after a passed security check, then
-setting the branch's upstream when it has none.
+publish.py does the push after a passed security check, then sets the
+branch's upstream when it has none. editing.py reads and saves the files the
+page's editor opens, unless --read-only is given.
 """
 
 import argparse
@@ -51,6 +52,12 @@ RUN_LOG_HEAD_BYTES = 4096
 DELETED_FILE_REASON = "deleted in this diff, so there is nothing to read"
 # The POST bodies are tiny ({"branch": ...}); anything larger is refused.
 MAX_POST_BODY_BYTES = 65536
+# A save from the editor carries the whole file (editing.py allows 2 MB).
+# JSON escapes tabs, quotes and backslashes as two characters each, hence
+# the extra room.
+MAX_SAVE_BODY_BYTES = 8 * 1024 * 1024
+# The answer to an editor request when BranchLens was started with --read-only.
+READ_ONLY_ERROR = "Editing is off: BranchLens was started with --read-only."
 # The bare verdict words the toolkit writes (gate and pipeline).
 VERDICT_WORDS = ("READY TO PUBLISH", "DO NOT PUBLISH", "INCONCLUSIVE",
                  "PASSED", "FAILED")
@@ -101,6 +108,8 @@ class BranchLensHandler(BaseHTTPRequestHandler):
     toolkit_path = None
     # Host suffixes a push must never go to (--no-push-host), lowercased.
     blocked_push_hosts = []
+    # True with --read-only: the editor is off and no file is ever saved.
+    read_only = False
     # Three random secrets, made at every start. The URL printed at start
     # carries launch_code. Opening that URL sets the cookie_secret cookie,
     # which every GET of the page or the API must carry, and hands
@@ -198,6 +207,7 @@ class BranchLensHandler(BaseHTTPRequestHandler):
             elif route == "/api/state":
                 state = gitops.get_state(self.repo_root, self.launch_worktree_root)
                 state["launch_id"] = self.launch_id
+                state["editing"] = not self.read_only
                 self.send_json(200, state)
             elif route == "/api/graph":
                 graph = gitops.get_graph(self.repo_root)
@@ -264,6 +274,11 @@ class BranchLensHandler(BaseHTTPRequestHandler):
                     self.repo_root, side, file_path, branch, commit, base
                 )
                 self.send_json(200, file_text)
+            elif route == "/api/edit-file":
+                # The file on disk, to open in the editor.
+                self.open_file_for_editing(
+                    self.read_param(params, "branch"), self.read_param(params, "path")
+                )
             elif route == "/api/network":
                 branch = self.read_param(params, "branch")
                 commit = self.read_param(params, "commit")
@@ -606,7 +621,7 @@ class BranchLensHandler(BaseHTTPRequestHandler):
             return "Only JSON requests are accepted."
         return None
 
-    def read_json_body(self):
+    def read_json_body(self, max_bytes=MAX_POST_BODY_BYTES):
         """The request body as a dict, or None when it is not a JSON object.
 
         An empty body counts as {} (the cancel route needs no fields).
@@ -615,7 +630,7 @@ class BranchLensHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             return None
-        if length < 0 or length > MAX_POST_BODY_BYTES:
+        if length < 0 or length > max_bytes:
             return None
         if length == 0:
             return {}
@@ -635,11 +650,14 @@ class BranchLensHandler(BaseHTTPRequestHandler):
         if refusal is not None:
             self.send_json(403, {"error": refusal})
             return
-        body = self.read_json_body()
+        route = urlparse(self.path).path
+        if route == "/api/save-file":
+            body = self.read_json_body(MAX_SAVE_BODY_BYTES)
+        else:
+            body = self.read_json_body()
         if body is None:
             self.send_json(400, {"error": "The request body must be a JSON object."})
             return
-        route = urlparse(self.path).path
         try:
             if route == "/api/run":
                 self.start_security_run(body)
@@ -653,6 +671,8 @@ class BranchLensHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"cancelled": RUNNER.cancel(feed_run_id)})
             elif route == "/api/push":
                 self.push_checked_branch(body)
+            elif route == "/api/save-file":
+                self.save_edited_file(body)
             else:
                 self.send_json(404, {"error": "No such API route: " + route})
         # BranchNotFound is a GitError: an unknown branch is a 400 here, not a 404.
@@ -677,6 +697,80 @@ class BranchLensHandler(BaseHTTPRequestHandler):
             raise gitops.BranchNotFound("No branch named '" + branch + "' was found.")
         branch_to_worktree, _all_paths, _raw = gitops.get_worktrees(self.repo_root)
         return branch_to_worktree.get(branch), branch_tips[branch]
+
+    def editable_worktree(self, branch):
+        """The worktree folder where the branch is checked out, for the editor.
+
+        Sends the refusal itself and returns None when editing is off, the
+        branch is unknown or it has no worktree.
+        """
+        from branchlens import gitops
+
+        if self.read_only:
+            self.send_json(403, {"error": READ_ONLY_ERROR})
+            return None
+        if not isinstance(branch, str) or branch == "":
+            self.send_json(400, {"error": "Missing 'branch'."})
+            return None
+        try:
+            worktree_path, _tip = self.find_branch_worktree(branch)
+        except gitops.BranchNotFound as error:
+            self.send_json(404, {"error": str(error)})
+            return None
+        if worktree_path is None:
+            self.send_json(400, {"error": "'" + branch + "' is not checked out in any "
+                                 "worktree, so there is no file on disk to edit."})
+            return None
+        return worktree_path
+
+    def open_file_for_editing(self, branch, file_path):
+        """GET /api/edit-file?branch=&path=: {path, text, sha256} of the file on disk."""
+        from branchlens import editing
+
+        worktree_path = self.editable_worktree(branch)
+        if worktree_path is None:
+            return
+        if file_path is None:
+            self.send_json(400, {"error": "Missing 'path' query parameter."})
+            return
+        try:
+            self.send_json(200, editing.read_editable_file(worktree_path, file_path))
+        except editing.EditRefused as error:
+            self.send_json(400, {"error": str(error)})
+
+    def save_edited_file(self, body):
+        """POST /api/save-file {branch, path, text, sha256}: write the editor's text.
+
+        sha256 is the hash /api/edit-file (or the last save) gave. When the
+        file on disk no longer has it, nothing is written and the answer is
+        409. A save answers {path, sha256, saved: true} with the new hash.
+        """
+        from branchlens import editing
+
+        worktree_path = self.editable_worktree(body.get("branch"))
+        if worktree_path is None:
+            return
+        file_path = body.get("path")
+        text = body.get("text")
+        expected_sha256 = body.get("sha256")
+        if not isinstance(file_path, str) or file_path == "":
+            self.send_json(400, {"error": "Missing 'path'."})
+            return
+        if not isinstance(text, str):
+            self.send_json(400, {"error": "'text' must be a string."})
+            return
+        if not isinstance(expected_sha256, str) or expected_sha256 == "":
+            self.send_json(400, {"error": "Missing 'sha256'."})
+            return
+        try:
+            saved = editing.save_editable_file(worktree_path, file_path, text, expected_sha256)
+        except editing.EditConflict as error:
+            self.send_json(409, {"error": str(error)})
+            return
+        except editing.EditRefused as error:
+            self.send_json(400, {"error": str(error)})
+            return
+        self.send_json(200, saved)
 
     def start_security_run(self, body):
         """POST /api/run {branch, base?}: start the pipeline on one branch.
@@ -1798,8 +1892,9 @@ def main():
         description="Local web app to browse what each git branch changes. It "
                     "only reads the repository (git may refresh the file stat "
                     "cache in .git/index while comparing a worktree), except "
-                    "for the push you click after a passed security check, "
-                    "which also sets the branch's upstream when it has none.",
+                    "for a file you save from the page's editor and the push "
+                    "you click after a passed security check, which also sets "
+                    "the branch's upstream when it has none.",
     )
     parser.add_argument(
         "path",
@@ -1860,6 +1955,11 @@ def main():
              "(repeatable; also read from BRANCHLENS_NO_PUSH_HOSTS, "
              "comma-separated)",
     )
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="turn the page's editor off, so no file is ever saved from it",
+    )
     parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     args = parser.parse_args()
 
@@ -1904,6 +2004,7 @@ def main():
               "named differently; runs started from the page will not show",
               file=sys.stderr)
 
+    BranchLensHandler.read_only = args.read_only
     BranchLensHandler.blocked_push_hosts = normalise_host_suffixes(
         args.no_push_host + [os.environ.get("BRANCHLENS_NO_PUSH_HOSTS", "")]
     )

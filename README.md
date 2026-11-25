@@ -6,10 +6,11 @@ A vibe coded tool to help you vibe code.
 
 ![BranchLens updating by itself while an agent writes two files and edits a third on a feature branch](docs/demo.gif)
 
-A read-only page that shows what each branch and worktree of a git repository
+A page that shows what each branch and worktree of a git repository
 changes since it forked from `origin/main`, uncommitted and untracked files
-included. It refreshes by itself. An optional security check judges a branch
-and pushes it when it passes.
+included. It refreshes by itself. You can also type changes into a file and
+save them. An optional security check judges a branch and pushes it when it
+passes.
 
 Python 3.9+ (standard library only), git 2.31+, macOS or Linux.
 
@@ -24,7 +25,7 @@ Python 3.9+ (standard library only), git 2.31+, macOS or Linux.
 
 ## Use
 
-    branchlens [path] [--port N] [--no-browser | --browser] [--check]
+    branchlens [path] [--port N] [--no-browser | --browser] [--check] [--read-only]
 
 Open the printed URL; each start prints a new access code. Branches lists
 every branch, with an amber dot on uncommitted edits. Tree draws the last 150
@@ -32,6 +33,12 @@ commits. Network shows which files import which (Python, JavaScript,
 TypeScript, Java). The comments button in a file's header marks its
 comments and docstrings and fades the rest of the code; it stays on as you
 open other files. Ctrl+C stops it.
+
+The edit button in a file's header opens the file on disk in a text box, for
+a branch checked out in a worktree. Tab indents, Enter keeps the line's
+indentation, Ctrl+S (⌘S on a Mac) saves and Esc closes. A save is refused
+when the file changed on disk after you opened it. Symbolic links, binary files, files over 2 MB and
+anything inside `.git` cannot be edited. `--read-only` turns the editor off.
 
 ## Security check and Push
 
@@ -87,7 +94,8 @@ without Claude (exit 0 passed, 1 failed, 2 inconclusive). Reports go to
 
 Viewing runs none of the repository's code: git's config-named programs
 (diff drivers, filters, hooks, fsmonitor) are off, and BranchLens never
-fetches or writes except a Push you click. The server listens on 127.0.0.1.
+fetches or writes except a file you save from the editor and a Push you
+click. The server listens on 127.0.0.1.
 Anyone with the printed URL has access; the buttons also need a page token
 and a matching Origin. READY TO PUBLISH means nothing blocking was found, not
 that the code is secure.
